@@ -1,0 +1,2738 @@
+import { useCallback, useEffect, useRef, useState } from "react";
+import { flushSync } from "react-dom";
+import {
+  MousePointer2,
+  Minus,
+  RectangleHorizontal,
+  Circle,
+  Spline,
+  Waypoints,
+  Type,
+  MapPin,
+  Hexagon,
+  Save,
+  FolderOpen,
+  FilePlus2,
+  Download,
+  Undo2,
+  Redo2,
+  ChevronDown,
+  ChevronRight,
+  Eye,
+  EyeOff,
+  Plus,
+  X,
+  Check,
+  Trash2,
+  Settings2,
+  Grid3X3,
+  Magnet,
+  LockKeyhole,
+  Equal,
+  AlignHorizontalJustifyCenter,
+  Move,
+  Scissors,
+  CornerUpRight,
+  Copy,
+  RotateCw,
+  FlipHorizontal2,
+  Rows3,
+  Scaling,
+  Ruler,
+  CircleDot,
+  Triangle,
+  GitMerge,
+  Unlink,
+  PanelLeftClose,
+  PanelRightClose,
+  MoreHorizontal,
+  FileJson,
+  LoaderCircle,
+  AlertTriangle,
+  SlidersHorizontal,
+  Pencil,
+  Square,
+  Crosshair,
+  Maximize2,
+  CircleDashed,
+  GitBranch,
+  CircleHelp,
+  Tangent,
+  AlignHorizontalDistributeCenter,
+  AlignVerticalDistributeCenter,
+  ArrowDownToLine,
+  type LucideIcon,
+} from "lucide-react";
+import {
+  type Document,
+  type Sketch,
+  type Selection,
+  type Entity,
+  type XY,
+  type ConstraintKind,
+  type Constraint,
+  emptyDocument,
+  demoDocument,
+  clone,
+  uid,
+  validateDocument,
+  deleteEntities,
+  constraintLabels,
+  kindLabels,
+  entity,
+  resolveEntity,
+  referencePoint,
+} from "./model";
+import {
+  dist,
+  bounds,
+  validGeometry,
+  updateDerived,
+  sub,
+  add,
+  mul,
+  normalize,
+  arcInfo,
+  blendEntity,
+} from "./geometry";
+import {
+  type Tool,
+  type CreateConfig,
+  defaultConfig,
+  toolLabels,
+  toolClicks,
+  createGeometry,
+} from "./creation";
+import {
+  initSolver,
+  solveSketch,
+  canConstrain,
+  type SolverResult,
+} from "./solver";
+import { modifySketch } from "./operations";
+import {
+  applyParameters,
+  evaluateExpression,
+  resolveParameters,
+  hasParameterReferences,
+} from "./parameters";
+import { exportDxf, exportSvg, exportJson, download } from "./export";
+import { Viewport } from "./Viewport";
+import { appendSplinePoint } from "./splineDraft";
+import { defaultSnapOptions, type SnapOptions } from "./snapping";
+import {
+  resolveDimension,
+  selectionRefs,
+  pointLineDistance,
+  isParallelPair,
+  type DimensionPickMode,
+} from "./dimensionPick";
+import { type DragEvent, type DragFeedback } from "./dragging";
+import {
+  dragPosition,
+  solveDrag,
+  resolveBodyDragEntities,
+  type DragDriver,
+} from "./dragTransaction";
+import "./app.css";
+const STORAGE = "sketchworks.document.v1";
+const DIRECTION_CONSTRAINTS: ConstraintKind[] = [
+  "horizontal",
+  "vertical",
+  "parallel",
+  "perpendicular",
+  "collinear",
+  "angle",
+];
+const toolIcons: Record<Tool, LucideIcon> = {
+  select: MousePointer2,
+  line: Minus,
+  midline: AlignHorizontalDistributeCenter,
+  rectangle: RectangleHorizontal,
+  centerRectangle: Square,
+  circle: Circle,
+  threeCircle: CircleDot,
+  arc: CornerUpRight,
+  centerArc: CircleDashed,
+  polygon: Hexagon,
+  ellipse: Circle,
+  slot: RectangleHorizontal,
+  arcSlot: GitMerge,
+  spline: Spline,
+  bezier: Waypoints,
+  conic: GitBranch,
+  point: MapPin,
+  text: Type,
+};
+const constraintIcons: Record<ConstraintKind, LucideIcon> = {
+  coincident: GitMerge,
+  horizontal: Minus,
+  vertical: AlignVerticalDistributeCenter,
+  parallel: AlignHorizontalJustifyCenter,
+  perpendicular: CornerUpRight,
+  equal: Equal,
+  fixed: LockKeyhole,
+  onLine: ArrowDownToLine,
+  tangent: Tangent,
+  concentric: CircleDot,
+  midpoint: AlignHorizontalDistributeCenter,
+  symmetric: FlipHorizontal2,
+  collinear: Minus,
+  length: Ruler,
+  lineDistance: AlignVerticalDistributeCenter,
+  distanceX: AlignHorizontalDistributeCenter,
+  distanceY: AlignVerticalDistributeCenter,
+  radius: CircleDot,
+  diameter: Circle,
+  angle: Triangle,
+};
+const operationIcons: Record<string, LucideIcon> = {
+  fillet: CornerUpRight,
+  chamfer: Triangle,
+  blend: Spline,
+  offset: Copy,
+  trim: Scissors,
+  extend: CornerUpRight,
+  break: Unlink,
+  scale: Scaling,
+  move: Move,
+  rotate: RotateCw,
+  copy: Copy,
+  mirror: FlipHorizontal2,
+  rectangularArray: Grid3X3,
+  circularArray: CircleDashed,
+  detach: Unlink,
+};
+const operationNames: Record<string, string> = {
+  fillet: "圆角",
+  chamfer: "倒角",
+  blend: "过渡曲线",
+  offset: "偏移",
+  trim: "修剪",
+  extend: "延伸",
+  break: "断开",
+  scale: "草图缩放",
+  move: "移动",
+  rotate: "旋转",
+  copy: "复制",
+  mirror: "镜像",
+  rectangularArray: "矩形阵列",
+  circularArray: "环形阵列",
+  detach: "解除关联",
+};
+interface Field {
+  key: string;
+  label: string;
+  value: string;
+  unit?: string;
+  type?: "text" | "textarea" | "select";
+  options?: string[];
+}
+interface Modal {
+  title: string;
+  fields: Field[];
+  confirm: (values: Record<string, string>) => boolean;
+  description?: string;
+  submit?: string;
+}
+function IconButton({
+  icon: Icon,
+  title,
+  active = false,
+  disabled = false,
+  onClick,
+  className = "",
+}: {
+  icon: LucideIcon;
+  title: string;
+  active?: boolean;
+  disabled?: boolean;
+  onClick: () => void;
+  className?: string;
+}) {
+  return (
+    <button
+      className={`icon-button ${active ? "active" : ""} ${className}`}
+      title={title}
+      aria-label={title}
+      aria-pressed={active}
+      disabled={disabled}
+      onClick={onClick}
+    >
+      <Icon size={18} />
+    </button>
+  );
+}
+function ModalView({ modal, onClose }: { modal: Modal; onClose: () => void }) {
+  const [values, setValues] = useState<Record<string, string>>(() =>
+    Object.fromEntries(modal.fields.map((f) => [f.key, f.value])),
+  );
+  return (
+    <div
+      className="modal-shade"
+      onPointerDown={(e) => {
+        if (e.target === e.currentTarget) onClose();
+      }}
+    >
+      <form
+        className="dialog"
+        onSubmit={(e) => {
+          e.preventDefault();
+          if (modal.confirm(values)) onClose();
+        }}
+      >
+        <div className="dialog-title">
+          <h2>{modal.title}</h2>
+          <IconButton icon={X} title="关闭对话框" onClick={onClose} />
+        </div>
+        {modal.description && (
+          <div className="dialog-warning">{modal.description}</div>
+        )}
+        <div className="dialog-fields">
+          {modal.fields.map((f, i) => (
+            <label className="field" key={f.key}>
+              <span>{f.label}</span>
+              <div className="input-unit">
+                {f.type === "select" ? (
+                  <select
+                    aria-label={f.label}
+                    value={values[f.key]}
+                    onChange={(e) =>
+                      setValues({ ...values, [f.key]: e.target.value })
+                    }
+                  >
+                    {f.options?.map((v) => (
+                      <option key={v}>{v}</option>
+                    ))}
+                  </select>
+                ) : f.type === "textarea" ? (
+                  <textarea
+                    autoFocus={i === 0}
+                    aria-label={f.label}
+                    value={values[f.key]}
+                    onChange={(e) =>
+                      setValues({ ...values, [f.key]: e.target.value })
+                    }
+                    maxLength={10000}
+                  />
+                ) : (
+                  <input
+                    autoFocus={i === 0}
+                    aria-label={f.label}
+                    value={values[f.key]}
+                    onChange={(e) =>
+                      setValues({ ...values, [f.key]: e.target.value })
+                    }
+                    maxLength={500}
+                  />
+                )}
+                <span>{f.unit}</span>
+              </div>
+            </label>
+          ))}
+        </div>
+        <div className="dialog-actions">
+          <button type="button" className="button" onClick={onClose}>
+            取消
+          </button>
+          <button type="submit" className="button primary">
+            <Check size={15} />
+            {modal.submit ?? "确定"}
+          </button>
+        </div>
+      </form>
+    </div>
+  );
+}
+function MenuItem({
+  icon: Icon,
+  label,
+  shortcut,
+  onClick,
+  disabled = false,
+}: {
+  icon: LucideIcon;
+  label: string;
+  shortcut?: string;
+  onClick: () => void;
+  disabled?: boolean;
+}) {
+  return (
+    <button className="menu-item" onClick={onClick} disabled={disabled}>
+      <Icon size={17} />
+      <span>{label}</span>
+      {shortcut && <kbd>{shortcut}</kbd>}
+    </button>
+  );
+}
+function initialDocument(): Document {
+  try {
+    const stored = localStorage.getItem(STORAGE);
+    if (stored) return validateDocument(JSON.parse(stored));
+  } catch {
+    /* Keep editing available when local storage is restricted. */
+  }
+  return demoDocument();
+}
+export default function App() {
+  const [doc, setDocState] = useState<Document>(initialDocument),
+    docRef = useRef(doc);
+  const setDoc = useCallback((next: Document) => {
+    docRef.current = next;
+    setDocState(next);
+  }, []);
+  const [activeId, setActiveId] = useState(doc.sketches[0].id),
+    [selection, setSelection] = useState<Selection[]>([]),
+    [tool, setTool] = useState<Tool>("select"),
+    [drafts, setDrafts] = useState<XY[]>([]),
+    draftSnaps = useRef<(string | undefined)[]>([]),
+    draftCaptured = useRef(false);
+  const [config, setConfig] = useState<CreateConfig>(defaultConfig),
+    [ready, setReady] = useState(false),
+    [solverState, setSolverState] = useState<SolverResult>({
+      ok: true,
+      dof: 0,
+      status: "Loading",
+      conflicting: [],
+    });
+  const [grid, setGrid] = useState(true),
+    [snap, setSnap] = useState(true),
+    [snapOptions, setSnapOptions] = useState<SnapOptions>(defaultSnapOptions),
+    [fitKey, setFitKey] = useState(0),
+    [cursor, setCursor] = useState<XY>({ x: 0, y: 0 }),
+    [menu, setMenu] = useState<string | null>(null),
+    [modal, setModal] = useState<Modal | null>(null),
+    [toast, setToast] = useState<{ text: string; error: boolean } | null>(null),
+    [saved, setSaved] = useState(false),
+    [historyVersion, setHistoryVersion] = useState(0),
+    [leftOpen, setLeftOpen] = useState(window.innerWidth > 960),
+    [rightOpen, setRightOpen] = useState(window.innerWidth > 1100),
+    [pickOperation, setPickOperation] = useState<string | undefined>(),
+    [dimensionMode, setDimensionMode] = useState(false),
+    [dimensionKindMode, setDimensionKindMode] =
+      useState<DimensionPickMode>("auto"),
+    [dimensionPicks, setDimensionPicks] = useState<string[]>([]),
+    [dimensionAdjustmentId, setDimensionAdjustmentId] = useState<string | null>(
+      null,
+    ),
+    [dimensionDraft, setDimensionDraft] = useState<{
+      constraintId?: string;
+      kind: ConstraintKind;
+      refs: string[];
+      anchor?: XY;
+      labelPosition?: XY;
+      preserveParallel?: boolean;
+      value: string;
+      unit: string;
+    } | null>(null);
+  const history = useRef<Document[]>([]),
+    future = useRef<Document[]>([]),
+    dragBefore = useRef<Document | null>(null),
+    dragSession = useRef<{
+      document: Document;
+      sketchId: string;
+      selection: Selection[];
+      primary: Selection;
+      target: XY;
+      entityIds?: readonly string[];
+    } | null>(null),
+    fileInput = useRef<HTMLInputElement>(null),
+    toastTimer = useRef<ReturnType<typeof setTimeout>>(undefined);
+  const sketch = doc.sketches.find((s) => s.id === activeId) ?? doc.sketches[0];
+  const dimensionAdjustment = dimensionAdjustmentId
+    ? sketch.constraints.find((c) => c.id === dimensionAdjustmentId)
+    : undefined;
+  const dimensionRequest =
+    dimensionMode && !dimensionDraft && !dimensionAdjustment
+      ? resolveDimension(sketch, dimensionPicks, dimensionKindMode)
+      : null;
+  const selectedEntities = sketch.entities.filter((e) =>
+    selection.some((s) => s.entityId === e.id),
+  );
+  const one = selectedEntities.length === 1 ? selectedEntities[0] : undefined;
+  const unit = doc.unit === "in" ? "in" : "mm",
+    factor = doc.unit === "in" ? 25.4 : 1;
+  const formatted = (n: number) => Number((n / factor).toFixed(3)).toString();
+  const notify = useCallback((text: string, error = false) => {
+    setToast({ text, error });
+    clearTimeout(toastTimer.current);
+    toastTimer.current = setTimeout(() => setToast(null), error ? 6500 : 3000);
+  }, []);
+  const solveDocument = (
+    candidate: Document,
+    drag?: DragDriver,
+    solvingSketchId = activeId,
+  ): SolverResult => {
+    applyParameters(candidate);
+    let current: SolverResult = {
+      ok: true,
+      dof: 0,
+      status: "Success",
+      conflicting: [],
+    };
+    for (const sk of candidate.sketches) {
+      const derived = new Set(
+        sk.entities
+          .filter((e) => e.sourceId)
+          .flatMap((e) => [e.id, ...e.points.map((p) => p.id)]),
+      );
+      if (sk.constraints.some((c) => c.refs.some((r) => derived.has(r))))
+        throw new Error("派生对象请通过源对象编辑，或先解除关联");
+      const base = { ...sk, entities: sk.entities.filter((e) => !e.sourceId) };
+      const result = solveSketch(
+        base,
+        sk.id === solvingSketchId ? drag : undefined,
+      );
+      if (!result.ok)
+        throw Object.assign(new Error("约束无法满足，已保留原草图"), {
+          conflicting: result.conflicting,
+        });
+      updateDerived(sk);
+      validGeometry(sk);
+      if (sk.id === solvingSketchId) current = result;
+    }
+    return current;
+  };
+  const commit = (candidate: Document, label = "操作", record = true) => {
+    if (!ready) {
+      notify("求解器正在加载", true);
+      return false;
+    }
+    try {
+      const result = solveDocument(candidate);
+      if (record) {
+        history.current.push(clone(docRef.current));
+        if (history.current.length > 100) history.current.shift();
+        future.current = [];
+        setHistoryVersion((v) => v + 1);
+      }
+      setDoc(candidate);
+      docRef.current = candidate;
+      setSolverState(result);
+      setSaved(false);
+      return true;
+    } catch (error) {
+      const e = error as Error & { conflicting?: string[] };
+      setSolverState((prev) => ({ ...prev, conflicting: e.conflicting ?? [] }));
+      notify(`${label}：${e.message}`, true);
+      return false;
+    }
+  };
+  const transaction = (
+    label: string,
+    fn: (candidate: Document, active: Sketch) => void,
+  ) => {
+    try {
+      const next = clone(docRef.current);
+      const sk =
+        next.sketches.find((s) => s.id === activeId) ?? next.sketches[0];
+      fn(next, sk);
+      return commit(next, label);
+    } catch (error) {
+      notify(`${label}：${(error as Error).message}`, true);
+      return false;
+    }
+  };
+  useEffect(() => {
+    let alive = true;
+    initSolver()
+      .then(() => {
+        if (!alive) return;
+        setReady(true);
+        const next = clone(docRef.current);
+        try {
+          const result = solveDocument(next);
+          setDoc(next);
+          setSolverState(result);
+        } catch (error) {
+          notify((error as Error).message, true);
+        }
+      })
+      .catch((error) => notify(`求解器加载失败：${String(error)}`, true));
+    return () => {
+      alive = false;
+    };
+  }, []);
+  useEffect(() => {
+    setSaved(false);
+    const timer = setTimeout(() => {
+      try {
+        localStorage.setItem(STORAGE, JSON.stringify(doc));
+        setSaved(true);
+      } catch {
+        notify("本地保存失败，编辑内容仍保留在内存中", true);
+      }
+    }, 600);
+    return () => clearTimeout(timer);
+  }, [doc, notify]);
+  useEffect(() => {
+    const sk = doc.sketches.find((s) => s.id === activeId);
+    if (sk && ready) {
+      const base = clone(sk);
+      base.entities = base.entities.filter((e) => !e.sourceId);
+      const result = solveSketch(base);
+      if (result.ok) setSolverState(result);
+    }
+  }, [activeId, ready]);
+  const setMode = (mode: Tool) => {
+    setTool(mode);
+    setDrafts([]);
+    draftSnaps.current = [];
+    draftCaptured.current = false;
+    setPickOperation(undefined);
+    setDimensionMode(false);
+    setDimensionDraft(null);
+    setDimensionAdjustmentId(null);
+    setDimensionPicks([]);
+    setMenu(null);
+  };
+  const cancel = () => {
+    setDrafts([]);
+    draftSnaps.current = [];
+    draftCaptured.current = false;
+    setPickOperation(undefined);
+    setMode("select");
+    setMenu(null);
+  };
+  const undo = () => {
+    const previous = history.current.pop();
+    if (!previous) return;
+    future.current.push(clone(docRef.current));
+    const previousSk = previous.sketches.some((s) => s.id === activeId)
+      ? activeId
+      : previous.sketches[0].id;
+    setActiveId(previousSk);
+    commit(previous, "撤销", false);
+    setHistoryVersion((v) => v + 1);
+    cancelDimensions();
+    setSelection([]);
+    setDrafts([]);
+  };
+  const redo = () => {
+    const next = future.current.pop();
+    if (!next) return;
+    history.current.push(clone(docRef.current));
+    setActiveId(
+      next.sketches.some((s) => s.id === activeId)
+        ? activeId
+        : next.sketches[0].id,
+    );
+    commit(next, "重做", false);
+    setHistoryVersion((v) => v + 1);
+    cancelDimensions();
+    setSelection([]);
+  };
+  const removeSelected = () => {
+    if (!selection.length) return;
+    if (
+      transaction("删除", (_, s) =>
+        deleteEntities(
+          s,
+          selection.map((p) => p.entityId),
+        ),
+      )
+    ) {
+      setSelection([]);
+      cancelDimensions();
+    }
+  };
+  const saveJson = () => {
+    download(`${doc.name}.sketch.json`, exportJson(doc), "application/json");
+    notify("草图文件已下载");
+    setMenu(null);
+  };
+  useEffect(() => {
+    const handler = (e: KeyboardEvent) => {
+      if ((e.target as HTMLElement)?.matches("input,textarea,select") || modal)
+        return;
+      const key = e.key.toLowerCase();
+      if ((e.ctrlKey || e.metaKey) && key === "z") {
+        e.preventDefault();
+        e.shiftKey ? redo() : undo();
+      } else if ((e.ctrlKey || e.metaKey) && key === "y") {
+        e.preventDefault();
+        redo();
+      } else if ((e.ctrlKey || e.metaKey) && key === "s") {
+        e.preventDefault();
+        saveJson();
+      } else if ((e.ctrlKey || e.metaKey) && key === "a") {
+        e.preventDefault();
+        setSelection(sketch.entities.map((e) => ({ entityId: e.id })));
+      } else if (key === "escape") {
+        if (dimensionDraft || dimensionPicks.length || dimensionMode)
+          cancelDimensions();
+        else cancel();
+      } else if (key === "delete" || key === "backspace") {
+        e.preventDefault();
+        removeSelected();
+      } else if (key === "enter" && tool === "spline") finishSpline();
+      else if (!e.ctrlKey && !e.metaKey) {
+        // Tool shortcuts must not type their letter into a freshly opened editor.
+        const shortcuts: Record<string, () => void> = {
+          l: () => setMode("line"),
+          r: () => setMode("rectangle"),
+          c: () => setMode("circle"),
+          d: () => startDimension(),
+          t: () => startOperation("trim"),
+          o: () => startOperation("offset"),
+          m: () => startOperation("move"),
+        };
+        const action = shortcuts[key];
+        if (action) {
+          e.preventDefault();
+          action();
+        }
+      }
+    };
+    window.addEventListener("keydown", handler);
+    return () => window.removeEventListener("keydown", handler);
+  });
+  const select = (s: Selection | null, additive: boolean) => {
+    if (!s) {
+      if (!additive) setSelection([]);
+      return;
+    }
+    setSelection((prev) =>
+      additive
+        ? prev.some((p) => p.entityId === s.entityId && p.pointId === s.pointId)
+          ? prev.filter(
+              (p) => !(p.entityId === s.entityId && p.pointId === s.pointId),
+            )
+          : [...prev, s]
+        : [s],
+    );
+  };
+  const refs = selection.map((s) => s.pointId ?? s.entityId);
+  const addConstraint = (
+    kind: ConstraintKind,
+    value?: number,
+    expression?: string,
+    existingId?: string,
+  ) =>
+    transaction(constraintLabels[kind], (_, s) => {
+      if (
+        selection.some(
+          (sel) => s.entities.find((e) => e.id === sel.entityId)?.sourceId,
+        )
+      )
+        throw new Error("派生对象须先解除关联");
+      const invalid = canConstrain(s, kind, refs);
+      if (invalid && !existingId) throw new Error("选取的对象不适用于此约束");
+      if (existingId) {
+        const c = s.constraints.find((c) => c.id === existingId);
+        if (!c) throw new Error("尺寸不存在");
+        c.value = value;
+        c.expression = expression;
+        return;
+      }
+      if (
+        s.constraints.some(
+          (c) =>
+            c.kind === kind &&
+            c.refs.length === refs.length &&
+            c.refs.every((r) => refs.includes(r)),
+        )
+      )
+        throw new Error("此约束已经存在");
+      s.constraints.push({
+        id: uid("c"),
+        kind,
+        refs: [...refs],
+        value,
+        expression,
+      });
+    });
+  const dimensionValue = (kind: ConstraintKind, rs = refs): number => {
+    const e = resolveEntity(sketch, rs[0]);
+    if (!e) return 10;
+    if (kind === "radius" || kind === "diameter") {
+      const r = e.kind === "arc" ? arcInfo(e).r : (e.radius ?? 1);
+      return kind === "diameter" ? 2 * r : r;
+    }
+    if (kind === "lineDistance") {
+      const point = referencePoint(sketch, rs[0]) ?? e.points[0],
+        line = resolveEntity(sketch, rs[1]);
+      return point && line?.kind === "line"
+        ? pointLineDistance(point, line)
+        : 10;
+    }
+    const ps =
+      rs.length === 1
+        ? e.points
+        : (rs.map((r) => referencePoint(sketch, r)).filter(Boolean) as XY[]);
+    if (kind === "angle") {
+      const v = sub(e.points[1], e.points[0]);
+      if (rs.length === 1) return (Math.atan2(v.y, v.x) * 180) / Math.PI;
+      const e2 = resolveEntity(sketch, rs[1]);
+      if (e2) {
+        const b = sub(e2.points[1], e2.points[0]);
+        return (
+          (Math.atan2(v.x * b.y - v.y * b.x, v.x * b.x + v.y * b.y) * 180) /
+          Math.PI
+        );
+      }
+      return 90;
+    }
+    if (ps.length < 2) return 10;
+    return kind === "distanceX"
+      ? ps[1].x - ps[0].x
+      : kind === "distanceY"
+        ? ps[1].y - ps[0].y
+        : dist(ps[0], ps[1]);
+  };
+  const dimensionAnchorFor = (targetRefs: string[]): XY | undefined => {
+    const points: XY[] = [];
+    for (const ref of targetRefs) {
+      const found = referencePoint(sketch, ref);
+      if (found) points.push({ x: found.x, y: found.y });
+    }
+    const single =
+      targetRefs.length === 1
+        ? resolveEntity(sketch, targetRefs[0])
+        : undefined;
+    if (points.length >= 2)
+      return {
+        x: (points[0].x + points[1].x) / 2,
+        y: (points[0].y + points[1].y) / 2,
+      };
+    if (single?.points.length)
+      return single.kind === "line" && single.points.length >= 2
+        ? {
+            x: (single.points[0].x + single.points[1].x) / 2,
+            y: (single.points[0].y + single.points[1].y) / 2,
+          }
+        : { x: single.points[0].x, y: single.points[0].y };
+    return points[0];
+  };
+  /** Open the inline value editor on the drawing area instead of a dialog. */
+  const openDimensionInput = (
+    kind: ConstraintKind,
+    targetRefs: string[],
+    options?: {
+      existingId?: string;
+      anchor?: XY;
+      labelPosition?: XY;
+      preserveParallel?: boolean;
+    },
+  ) => {
+    const existing = options?.existingId
+      ? sketch.constraints.find((item) => item.id === options.existingId)
+      : undefined;
+    const raw = existing?.value ?? dimensionValue(kind, targetRefs);
+    setDimensionAdjustmentId(null);
+    setDimensionDraft({
+      constraintId: options?.existingId,
+      kind,
+      refs: targetRefs,
+      anchor: options?.anchor ?? dimensionAnchorFor(targetRefs),
+      labelPosition: options?.labelPosition ?? existing?.labelPosition,
+      preserveParallel: options?.preserveParallel,
+      unit: kind === "angle" ? "°" : unit,
+      value:
+        existing?.expression ??
+        (kind === "angle" ? Number(raw.toFixed(3)).toString() : formatted(raw)),
+    });
+  };
+  const cancelDimensions = () => {
+    setDimensionDraft(null);
+    setDimensionAdjustmentId(null);
+    setDimensionPicks([]);
+    setDimensionMode(false);
+  };
+  const commitDimension = (text: string): boolean => {
+    const draft = dimensionDraft;
+    if (!draft) return false;
+    if (!text) {
+      notify("请输入尺寸数值或表达式", true);
+      return false;
+    }
+    try {
+      const vars = resolveParameters(docRef.current.parameters);
+      const isExpression = hasParameterReferences(text);
+      let value = evaluateExpression(
+        text,
+        vars,
+        draft.kind === "angle" ? "deg" : "mm",
+      );
+      if (!isExpression && draft.kind !== "angle") value *= factor;
+      const ok = transaction(
+        draft.constraintId
+          ? `编辑${constraintLabels[draft.kind]}`
+          : `添加${constraintLabels[draft.kind]}`,
+        (_, target) => {
+          if (draft.constraintId) {
+            const current = target.constraints.find(
+              (item) => item.id === draft.constraintId,
+            );
+            if (!current) throw new Error("尺寸不存在");
+            current.value = value;
+            current.expression = isExpression ? text : undefined;
+            return;
+          }
+          const live = draft.refs.filter((ref) => !!resolveEntity(target, ref));
+          if (live.length !== draft.refs.length)
+            throw new Error("标注对象已不存在");
+          const invalid = canConstrain(target, draft.kind, live);
+          if (invalid) throw new Error("选取的对象不适用于此尺寸");
+          if (
+            target.constraints.some(
+              (c) =>
+                c.kind === draft.kind &&
+                c.refs.length === live.length &&
+                c.refs.every((ref) => live.includes(ref)),
+            )
+          )
+            throw new Error("此尺寸已经存在");
+          target.constraints.push({
+            id: uid("c"),
+            kind: draft.kind,
+            refs: live,
+            value,
+            expression: isExpression ? text : undefined,
+            labelPosition: draft.labelPosition,
+          });
+          // Only a confirmed line pair implies a parallelism constraint.
+          if (draft.kind === "lineDistance" && draft.preserveParallel) {
+            const ids = live.map(
+              (ref) => resolveEntity(target, ref)?.id ?? ref,
+            );
+            const pair = ids.map((id) =>
+              target.entities.find((item) => item.id === id),
+            );
+            const locked = (id: string) =>
+              target.constraints.some(
+                (c) =>
+                  DIRECTION_CONSTRAINTS.includes(c.kind) &&
+                  c.refs.some(
+                    (ref) =>
+                      ref === id || resolveEntity(target, ref)?.id === id,
+                  ),
+              );
+            const related = target.constraints.some(
+              (c) =>
+                c.kind === "parallel" && ids.every((id) => c.refs.includes(id)),
+            );
+            if (
+              pair[0] &&
+              pair[1] &&
+              pair[0].kind === "line" &&
+              pair[1].kind === "line" &&
+              isParallelPair(pair[0], pair[1]) &&
+              !related &&
+              !(locked(ids[0]) && locked(ids[1]))
+            )
+              target.constraints.push({
+                id: uid("c"),
+                kind: "parallel",
+                refs: ids,
+              });
+          }
+        },
+      );
+      if (!ok) return false;
+      setDimensionDraft(null);
+      setDimensionPicks([]);
+      return true;
+    } catch (error) {
+      notify((error as Error).message, true);
+      return false;
+    }
+  };
+  const startDimension = (preferred: DimensionPickMode = dimensionKindMode) => {
+    if (!ready) return;
+    setTool("select");
+    setDrafts([]);
+    draftSnaps.current = [];
+    draftCaptured.current = false;
+    setPickOperation(undefined);
+    setMenu(null);
+    setDimensionMode(true);
+    setDimensionDraft(null);
+    setDimensionAdjustmentId(null);
+    const available = selectionRefs(selection);
+    const request = available.length
+      ? resolveDimension(sketch, available, preferred)
+      : null;
+    if (
+      request?.complete &&
+      (request.kind === "radius" || request.kind === "diameter")
+    ) {
+      setDimensionPicks([]);
+      openDimensionInput(request.kind, request.refs);
+      return;
+    }
+    setDimensionPicks(
+      request ? (request.complete ? available : request.refs) : [],
+    );
+  };
+  const adjustDimension = (id: string) => {
+    if (!dimensionMode || dimensionDraft) return;
+    if (!sketch.constraints.some((c) => c.id === id)) return;
+    setDimensionPicks([]);
+    setDimensionAdjustmentId(id);
+  };
+  const commitDimensionPosition = (id: string, world: XY) => {
+    if (!dimensionMode || dimensionDraft) return;
+    transaction("调整尺寸标注位置", (_, target) => {
+      const c = target.constraints.find((item) => item.id === id);
+      if (!c) throw new Error("尺寸不存在");
+      c.labelPosition = { ...world };
+    });
+    setDimensionAdjustmentId(null);
+  };
+  const pickDimension = (picked: Selection | null, world: XY) => {
+    if (!dimensionMode || dimensionDraft) return;
+    if (!picked) {
+      if (!dimensionRequest?.complete) {
+        notify("此处没有可标注的对象", true);
+        return;
+      }
+      openDimensionInput(dimensionRequest.kind, dimensionRequest.refs, {
+        anchor: world,
+        labelPosition: world,
+        preserveParallel:
+          dimensionPicks.length === 2 &&
+          dimensionPicks.every(
+            (ref) =>
+              resolveEntity(sketch, ref)?.id === ref &&
+              resolveEntity(sketch, ref)?.kind === "line",
+          ),
+      });
+      setDimensionPicks([]);
+      return;
+    }
+    const picks = [
+      ...new Set([...dimensionPicks, picked.pointId ?? picked.entityId]),
+    ];
+    const request = resolveDimension(sketch, picks, dimensionKindMode);
+    if (!request) {
+      notify("此对象不适用于当前尺寸类型", true);
+      return;
+    }
+    if (
+      request.complete &&
+      (request.kind === "radius" || request.kind === "diameter")
+    ) {
+      setDimensionPicks([]);
+      openDimensionInput(request.kind, request.refs, { anchor: world });
+      return;
+    }
+    setDimensionPicks(request.complete ? picks : request.refs);
+  };
+  const finishCreation = (
+    points: XY[],
+    snaps: (string | undefined)[],
+    mode = tool,
+    preserveCapturedCoordinates = false,
+  ) => {
+    let result: ReturnType<typeof createGeometry>;
+    try {
+      result = createGeometry(mode, points, {
+        ...config,
+        preserveCapturedCoordinates,
+      });
+    } catch (error) {
+      notify((error as Error).message, true);
+      return false;
+    }
+    const ok = transaction(toolLabels[mode], (_, s) => {
+      s.entities.push(...result.entities);
+      s.constraints.push(...result.constraints);
+      if (config.autoConstraint)
+        snaps.forEach((ref, index) => {
+          if (!ref) return;
+          const target =
+            mode === "spline"
+              ? result.entities[0].points[index]
+              : result.entities
+                  .flatMap((e) => e.points)
+                  .find((p) => dist(p, points[index]) < 1e-6);
+          if (
+            target &&
+            !s.constraints.some(
+              (c) =>
+                c.kind === "coincident" &&
+                c.refs.includes(target.id) &&
+                c.refs.includes(ref),
+            )
+          )
+            s.constraints.push({
+              id: uid("c"),
+              kind: "coincident",
+              refs: [target.id, ref],
+            });
+        });
+    });
+    if (ok) setSelection([]);
+    return ok;
+  };
+  const place = (p: XY, snapRef?: string, captured = false) => {
+    if (tool === "select" || !ready) return;
+    if (tool === "spline") {
+      const next = appendSplinePoint(drafts, draftSnaps.current, p, snapRef);
+      setDrafts(next.points);
+      draftSnaps.current = next.refs;
+      return;
+    }
+    const points = [...drafts, p],
+      snaps = [...draftSnaps.current, snapRef];
+    const preserveCapturedCoordinates = draftCaptured.current || captured;
+    if (points.length >= toolClicks[tool]) {
+      if (finishCreation(points, snaps, tool, preserveCapturedCoordinates)) {
+        if (tool === "line") {
+          const endpoint = docRef.current.sketches
+            .find((s) => s.id === activeId)!
+            .entities.at(-1)!.points[1];
+          setDrafts([{ x: endpoint.x, y: endpoint.y }]);
+          draftSnaps.current = [endpoint.id];
+          draftCaptured.current = captured;
+        } else {
+          setDrafts([]);
+          draftSnaps.current = [];
+          draftCaptured.current = false;
+        }
+      }
+    } else {
+      setDrafts(points);
+      draftSnaps.current = snaps;
+      draftCaptured.current = preserveCapturedCoordinates;
+    }
+  };
+  const finishSpline = (point?: XY, snapRef?: string) => {
+    const final = point
+      ? appendSplinePoint(drafts, draftSnaps.current, point, snapRef)
+      : { points: drafts, refs: draftSnaps.current };
+    if (
+      tool === "spline" &&
+      final.points.length >= 2 &&
+      finishCreation(final.points, final.refs)
+    ) {
+      setDrafts([]);
+      draftSnaps.current = [];
+      draftCaptured.current = false;
+    }
+  };
+  const drag = (event: DragEvent): DragFeedback => {
+    if (!ready) return { ok: false };
+    if (event.phase === "start") {
+      const before = clone(docRef.current);
+      const frozenSelection = selection.map((item) => ({ ...item }));
+      const primary = { entityId: event.entityId, pointId: event.pointId };
+      const initial = dragPosition(before, activeId, primary);
+      const sketch = before.sketches.find((item) => item.id === activeId);
+      if (!initial || !sketch) return { ok: false };
+      try {
+        const entityIds = event.pointId
+          ? undefined
+          : (event.entityIds ??
+            resolveBodyDragEntities(sketch, frozenSelection, primary));
+        dragBefore.current = before;
+        dragSession.current = {
+          document: docRef.current,
+          sketchId: activeId,
+          selection: frozenSelection,
+          primary,
+          target: initial,
+          entityIds,
+        };
+        return { ok: true, point: initial };
+      } catch (error) {
+        dragBefore.current = null;
+        dragSession.current = null;
+        notify((error as Error).message, true);
+        return { ok: false, point: initial };
+      }
+    }
+    const before = dragBefore.current,
+      session = dragSession.current;
+    if (!before || !session) return { ok: false };
+    if (
+      event.entityId !== session.primary.entityId ||
+      event.pointId !== session.primary.pointId
+    )
+      return { ok: false };
+    if (event.phase === "cancel") {
+      flushSync(() => setDoc(before));
+      dragBefore.current = null;
+      dragSession.current = null;
+      return { ok: true, point: dragPosition(before, session.sketchId, event) };
+    }
+    const finish = () => {
+      if (JSON.stringify(docRef.current) !== JSON.stringify(before)) {
+        history.current.push(before);
+        if (history.current.length > 100) history.current.shift();
+        future.current = [];
+        setHistoryVersion((value) => value + 1);
+      }
+      dragBefore.current = null;
+      dragSession.current = null;
+    };
+    try {
+      if (
+        event.phase === "move" &&
+        Math.hypot(
+          event.target.x - session.target.x,
+          event.target.y - session.target.y,
+        ) <= 1e-7
+      )
+        return {
+          ok: true,
+          point: dragPosition(session.document, session.sketchId, event),
+        };
+      const solved = solveDrag(
+        session.document,
+        session.sketchId,
+        session.selection,
+        event,
+        (candidate, driver) =>
+          solveDocument(candidate, driver, session.sketchId),
+        { previousTarget: session.target, entityIds: session.entityIds },
+      );
+      session.document = solved.document;
+      session.target = { ...event.target };
+      flushSync(() => {
+        setDoc(solved.document);
+        setSolverState(solved.result);
+        if (event.phase === "end") finish();
+      });
+      return { ok: true, point: solved.point };
+    } catch (error) {
+      if (event.phase === "end") {
+        const valid = session.document;
+        let result: SolverResult | undefined;
+        try {
+          result = solveDocument(clone(valid), undefined, session.sketchId);
+        } catch {
+          /* The accepted geometry remains authoritative on a rejected release. */
+        }
+        flushSync(() => {
+          setDoc(valid);
+          if (result?.ok) setSolverState(result);
+          finish();
+        });
+        notify(
+          event.exact
+            ? `捕获位置无法满足现有约束，已保留有效位置：${(error as Error).message}`
+            : (error as Error).message,
+          true,
+        );
+      }
+      return {
+        ok: false,
+        point: dragPosition(docRef.current, session.sketchId, event),
+      };
+    }
+  };
+  const field = (
+    key: string,
+    label: string,
+    value: number,
+    units = unit,
+  ): Field => ({ key, label, value: String(value), unit: units });
+  const runOperation = (
+    operation: string,
+    values: Record<string, number>,
+    pick?: XY,
+    targetId?: string,
+    expressions?: Record<string, string>,
+  ) => {
+    try {
+      const next = clone(docRef.current),
+        s = next.sketches.find((s) => s.id === activeId)!;
+      const ids = targetId ? [targetId] : selection.map((v) => v.entityId);
+      const result = modifySketch(s, ids, operation, values, pick);
+      if (expressions) {
+        const beforeIds = new Set(sketch.entities.map((e) => e.id));
+        for (const e of s.entities) {
+          if (beforeIds.has(e.id) || !e.transform) continue;
+          const t = e.transform;
+          if (operation === "rectangularArray") {
+            if (expressions.dx && Math.abs(values.dx) > 1e-9)
+              t.xExpression = `${(t.x ?? 0) / values.dx}*(${expressions.dx})`;
+            if (expressions.dy && Math.abs(values.dy) > 1e-9)
+              t.yExpression = `${(t.y ?? 0) / values.dy}*(${expressions.dy})`;
+          }
+          if (
+            operation === "circularArray" &&
+            expressions.angle &&
+            Math.abs(values.angle) > 1e-9
+          )
+            t.angleExpression = `${(t.angle ?? 0) / values.angle}*(${expressions.angle})`;
+        }
+      }
+      if (result.removedConstraints.length) {
+        setModal({
+          title: "确认修改几何",
+          description: `此操作将移除 ${result.removedConstraints.length} 项受影响的约束：${result.removedConstraints.map((id) => constraintLabels[sketch.constraints.find((c) => c.id === id)!.kind]).join("、")}`,
+          fields: [],
+          submit: "移除约束并修改",
+          confirm: () => {
+            const ok = commit(next, operationNames[operation]);
+            if (ok) {
+              setPickOperation(undefined);
+              setSelection([]);
+            }
+            return ok;
+          },
+        });
+        return false;
+      }
+      const ok = commit(next, operationNames[operation]);
+      if (ok) {
+        setSelection([]);
+        setPickOperation(undefined);
+      }
+      return ok;
+    } catch (error) {
+      notify((error as Error).message, true);
+      return false;
+    }
+  };
+  const startOperation = (op: string) => {
+    setMenu(null);
+    setDrafts([]);
+    setTool("select");
+    setDimensionMode(false);
+    setDimensionDraft(null);
+    setDimensionAdjustmentId(null);
+    setDimensionPicks([]);
+    if (["trim", "extend", "break"].includes(op)) {
+      setPickOperation(op);
+      return;
+    }
+    if (!selection.length) {
+      notify("请先选择对象", true);
+      return;
+    }
+    if (op === "detach" || op === "mirror") {
+      runOperation(op, {});
+      return;
+    }
+    if (op === "blend") {
+      if (selection.length !== 2 || selection.some((s) => s.pointId)) {
+        notify("过渡曲线需要选择两个对象", true);
+        return;
+      }
+      try {
+        const [a, b] = selection.map(
+          (sel) => sketch.entities.find((e) => e.id === sel.entityId)!,
+        );
+        if (a.sourceId || b.sourceId) throw new Error("请先解除关联");
+        const blended = blendEntity(a, b);
+        blended.id = uid();
+        blended.sourceId = a.id;
+        blended.transform = { kind: "blend", secondarySourceId: b.id };
+        transaction("过渡曲线", (_, s) => {
+          s.entities.push(blended);
+        });
+      } catch (error) {
+        notify((error as Error).message, true);
+      }
+      return;
+    }
+    const forms: Record<string, Field[]> = {
+      fillet: [field("radius", "半径", 5)],
+      chamfer: [
+        field("distance", "距离 1", 5),
+        field("distance2", "距离 2", 5),
+      ],
+      offset: [field("distance", "偏移距离", 3)],
+      move: [field("dx", "X 位移", 10), field("dy", "Y 位移", 0)],
+      copy: [field("dx", "X 位移", 20), field("dy", "Y 位移", 0)],
+      rotate: [
+        field("angle", "角度", 30, "°"),
+        field("cx", "中心 X", 0),
+        field("cy", "中心 Y", 0),
+      ],
+      scale: [
+        field("factor", "比例", 1.5, ""),
+        field("cx", "基点 X", 0),
+        field("cy", "基点 Y", 0),
+      ],
+      rectangularArray: [
+        field("cols", "列数", 3, ""),
+        field("rows", "行数", 2, ""),
+        field("dx", "X 间距", 20),
+        field("dy", "Y 间距", 20),
+      ],
+      circularArray: [
+        field("count", "数量", 6, ""),
+        field("angle", "总角度", 360, "°"),
+        field("cx", "中心 X", 0),
+        field("cy", "中心 Y", 0),
+      ],
+    };
+    setModal({
+      title: operationNames[op],
+      fields: forms[op] ?? [],
+      confirm: (vs) => {
+        try {
+          const values: Record<string, number> = {};
+          const vars = resolveParameters(docRef.current.parameters);
+          for (const f of forms[op] ?? [])
+            values[f.key] =
+              evaluateExpression(
+                vs[f.key],
+                vars,
+                f.unit === "°" ? "deg" : f.unit ? "mm" : "scalar",
+              ) *
+              (f.unit === unit && !hasParameterReferences(vs[f.key])
+                ? factor
+                : 1);
+          return runOperation(
+            op,
+            values,
+            undefined,
+            undefined,
+            Object.fromEntries(
+              Object.entries(vs).filter(([, v]) => hasParameterReferences(v)),
+            ),
+          );
+        } catch (error) {
+          notify((error as Error).message, true);
+          return false;
+        }
+      },
+    });
+  };
+  const openExport = () => {
+    setMenu(null);
+    setModal({
+      title: "导出草图",
+      fields: [
+        {
+          key: "format",
+          label: "文件格式",
+          value: "DXF",
+          type: "select",
+          options: ["DXF", "SVG"],
+        },
+        {
+          key: "scope",
+          label: "导出范围",
+          value: "当前草图",
+          type: "select",
+          options: ["当前草图", "所有可见草图"],
+        },
+        {
+          key: "construction",
+          label: "构造几何",
+          value: "不包含",
+          type: "select",
+          options: ["不包含", "包含"],
+        },
+        { key: "name", label: "文件名", value: doc.name, type: "text" },
+      ],
+      submit: "导出",
+      confirm: (values) => {
+        try {
+          if (!ready) throw new Error("求解器未就绪");
+          const output = clone(docRef.current);
+          solveDocument(output);
+          if (values.scope === "当前草图")
+            output.sketches = output.sketches
+              .filter((s) => s.id === activeId)
+              .map((s) => ({ ...s, visible: true }));
+          const options = {
+            allVisible: true,
+            construction: values.construction === "包含",
+          };
+          if (
+            !output.sketches.some(
+              (s) =>
+                s.visible &&
+                s.entities.some((e) => options.construction || !e.construction),
+            )
+          )
+            throw new Error("没有可导出的几何");
+          const isDxf = values.format === "DXF";
+          const content = isDxf
+            ? exportDxf(output, options)
+            : exportSvg(output, options);
+          download(
+            `${values.name}.${isDxf ? "dxf" : "svg"}`,
+            content,
+            isDxf ? "application/dxf" : "image/svg+xml",
+          );
+          notify(`${values.format} 已导出`);
+          return true;
+        } catch (error) {
+          notify((error as Error).message, true);
+          return false;
+        }
+      },
+    });
+  };
+  const openParameters = () => {
+    setMenu(null);
+    setModal({
+      title: "更改参数",
+      description: undefined,
+      fields: [
+        {
+          key: "parameters",
+          label: "名称, 表达式, 单位（每行一项）",
+          value: doc.parameters
+            .map((p) => `${p.name}, ${p.expression}, ${p.unit}`)
+            .join("\n"),
+          type: "textarea",
+        },
+      ],
+      confirm: (values) => {
+        try {
+          const parameters = values.parameters.trim()
+            ? values.parameters
+                .split(/\n|;/)
+                .filter(Boolean)
+                .map((line) => {
+                  const [name, expression, unit = "mm"] = line
+                    .split(",")
+                    .map((s) => s.trim());
+                  if (!["mm", "deg", "scalar"].includes(unit))
+                    throw new Error("单位仅支持 mm、deg、scalar");
+                  return {
+                    name,
+                    expression,
+                    unit: unit as "mm" | "deg" | "scalar",
+                  };
+                })
+            : [];
+          resolveParameters(parameters);
+          return transaction("更改参数", (candidate) => {
+            candidate.parameters = parameters;
+          });
+        } catch (error) {
+          notify((error as Error).message, true);
+          return false;
+        }
+      },
+    });
+  };
+  const newDocument = (demo = false) => {
+    setMenu(null);
+    setModal({
+      title: demo ? "打开示例草图" : "新建文档",
+      description: "当前文档将被替换。可先取消并下载草图文件。",
+      fields: [
+        {
+          key: "name",
+          label: "文档名称",
+          value: demo ? "连接板" : "未命名草图",
+        },
+      ],
+      submit: demo ? "打开示例" : "新建",
+      confirm: (values) => {
+        const next = demo ? demoDocument() : emptyDocument();
+        next.name = values.name.trim() || "未命名草图";
+        if (commit(next, "新建")) {
+          setActiveId(next.sketches[0].id);
+          setSelection([]);
+          setFitKey((v) => v + 1);
+          cancel();
+          return true;
+        }
+        return false;
+      },
+    });
+  };
+  const createSketch = () => {
+    transaction("新建草图", (candidate) => {
+      const s: Sketch = {
+        id: uid("sk"),
+        name: `草图 ${candidate.sketches.length + 1}`,
+        visible: true,
+        entities: [],
+        constraints: [],
+      };
+      candidate.sketches.push(s);
+      setActiveId(s.id);
+    });
+    setSelection([]);
+    cancel();
+  };
+  const editEntity = (e: Entity) => {
+    if (e.sourceId && e.transform) {
+      const t = e.transform;
+      if (!["translate", "rotate"].includes(t.kind)) {
+        notify("此对象通过源几何更新；可先解除关联后编辑", true);
+        return;
+      }
+      const fields: Field[] = [
+        {
+          key: "x",
+          label: t.kind === "rotate" ? "中心 X" : "X 位移",
+          value: t.xExpression ?? formatted(t.x ?? 0),
+          unit,
+        },
+        {
+          key: "y",
+          label: t.kind === "rotate" ? "中心 Y" : "Y 位移",
+          value: t.yExpression ?? formatted(t.y ?? 0),
+          unit,
+        },
+      ];
+      if (t.kind === "rotate")
+        fields.push({
+          key: "angle",
+          label: "角度",
+          value: t.angleExpression ?? String(t.angle ?? 0),
+          unit: "°",
+        });
+      setModal({
+        title: "关联变换",
+        fields,
+        confirm: (values) =>
+          transaction("关联变换", (_, s) => {
+            const target = s.entities.find(
+              (item) => item.id === e.id,
+            )!.transform!;
+            for (const key of ["x", "y", "angle"] as const) {
+              if (values[key] === undefined) continue;
+              const linked = hasParameterReferences(values[key]);
+              target[key] =
+                evaluateExpression(
+                  values[key],
+                  resolveParameters(docRef.current.parameters),
+                  key === "angle" ? "deg" : "mm",
+                ) * (key !== "angle" && !linked ? factor : 1);
+              const expressionKey =
+                key === "x"
+                  ? "xExpression"
+                  : key === "y"
+                    ? "yExpression"
+                    : "angleExpression";
+              target[expressionKey] = linked ? values[key] : undefined;
+            }
+          }),
+      });
+      return;
+    }
+    const fields: Field[] = [{ key: "name", label: "名称", value: e.name }];
+    if (e.kind === "circle" || e.kind === "arc")
+      fields.push(
+        field(
+          "radius",
+          "半径",
+          Number(formatted(e.kind === "arc" ? arcInfo(e).r : (e.radius ?? 1))),
+        ),
+      );
+    if (e.kind === "ellipse")
+      fields.push(field("ry", "短轴半径", Number(formatted(e.ry ?? 1))));
+    if (e.kind === "conic")
+      fields.push(field("weight", "权重", e.weight ?? 1, ""));
+    if (e.kind === "text")
+      fields.push(
+        { key: "text", label: "内容", value: e.text ?? "" },
+        field("fontSize", "高度", Number(formatted(e.fontSize ?? 6))),
+        field("rotation", "旋转", e.rotation ?? 0, "°"),
+      );
+    setModal({
+      title: "对象属性",
+      fields,
+      confirm: (values) =>
+        transaction("编辑属性", (_, s) => {
+          const item = s.entities.find((item) => item.id === e.id)!;
+          if (item.sourceId) throw new Error("请编辑源对象或解除关联");
+          item.name = values.name.trim() || kindLabels[item.kind];
+          for (const key of [
+            "radius",
+            "ry",
+            "weight",
+            "fontSize",
+            "rotation",
+          ] as const) {
+            if (
+              values[key] === undefined ||
+              values[key] === fields.find((f) => f.key === key)?.value
+            )
+              continue;
+            if (
+              s.constraints.some(
+                (c) => c.kind === "fixed" && c.refs.includes(item.id),
+              )
+            )
+              throw new Error("固定对象须先移除固定约束");
+            if (
+              key === "radius" &&
+              s.constraints.some(
+                (c) =>
+                  ["radius", "diameter"].includes(c.kind) &&
+                  c.refs.includes(item.id),
+              )
+            )
+              throw new Error("请编辑对应的半径或直径尺寸");
+            const n =
+              evaluateExpression(
+                values[key],
+                resolveParameters(doc.parameters),
+                key === "rotation" ? "deg" : key === "weight" ? "scalar" : "mm",
+              ) *
+              (!["weight", "rotation"].includes(key) &&
+              !hasParameterReferences(values[key])
+                ? factor
+                : 1);
+            if (key !== "rotation" && n <= 0) throw new Error("参数必须为正");
+            if (key === "radius" && item.kind === "arc") {
+              const ratio = n / arcInfo(item).r;
+              for (const p of item.points.slice(1))
+                Object.assign(
+                  p,
+                  add(item.points[0], mul(sub(p, item.points[0]), ratio)),
+                );
+            }
+            item[key] = n;
+          }
+          if (item.kind === "text") {
+            if (!values.text.trim()) throw new Error("文本不能为空");
+            item.text = values.text;
+          }
+        }),
+    });
+  };
+  const openToolConfig = (mode: Tool) => {
+    setMode(mode);
+    if (["polygon", "text", "conic"].includes(mode)) {
+      const fields =
+        mode === "polygon"
+          ? [
+              field("sides", "边数", config.sides, ""),
+              {
+                key: "polygonOuter",
+                label: "模式",
+                value: config.polygonOuter ? "外接" : "内接",
+                type: "select" as const,
+                options: ["内接", "外接"],
+              },
+            ]
+          : mode === "text"
+            ? [
+                { key: "text", label: "文本", value: config.text },
+                field("fontSize", "高度", Number(formatted(config.fontSize))),
+              ]
+            : [field("weight", "权重", config.weight, "")];
+      setModal({
+        title: toolLabels[mode],
+        fields,
+        confirm: (values) => {
+          try {
+            const next = { ...config };
+            if (values.sides) {
+              next.sides = Number(values.sides);
+              if (
+                !Number.isInteger(next.sides) ||
+                next.sides < 3 ||
+                next.sides > 100
+              )
+                throw new Error("边数范围为 3–100");
+              next.polygonOuter = values.polygonOuter === "外接";
+            }
+            if (values.text !== undefined) {
+              next.text = values.text;
+              next.fontSize = Number(values.fontSize) * factor;
+              if (!next.text.trim() || !(next.fontSize > 0))
+                throw new Error("内容和高度无效");
+            }
+            if (values.weight) {
+              next.weight = Number(values.weight);
+              if (!(next.weight > 0)) throw new Error("权重必须为正");
+            }
+            setConfig(next);
+            return true;
+          } catch (error) {
+            notify((error as Error).message, true);
+            return false;
+          }
+        },
+      });
+    }
+  };
+  const menuToggle = (name: string) => setMenu(menu === name ? null : name);
+  const constraintKinds: ConstraintKind[] = [
+    "coincident",
+    "horizontal",
+    "vertical",
+    "parallel",
+    "perpendicular",
+    "tangent",
+    "equal",
+    "fixed",
+    "concentric",
+    "midpoint",
+    "symmetric",
+    "collinear",
+    "onLine",
+  ];
+  return (
+    <div
+      className={`app ${leftOpen ? "" : "left-closed"} ${rightOpen ? "" : "right-closed"}`}
+      data-history={historyVersion}
+    >
+      <header className="app-header">
+        <div className="brand">
+          <div className="brand-mark">
+            <Hexagon size={23} strokeWidth={1.7} />
+            <Minus size={11} />
+          </div>
+          <strong>SketchWorks</strong>
+          <span className="brand-tag">CAD</span>
+        </div>
+        <div className="document-title">
+          <FileJson size={16} />
+          <input
+            aria-label="文档名称"
+            value={doc.name}
+            onChange={(e) =>
+              setDoc({ ...docRef.current, name: e.target.value })
+            }
+          />
+          <span className="save-dot" data-saved={saved} />
+        </div>
+        <div className="header-right">
+          <span className="save-label">{saved ? "本地已保存" : "未保存"}</span>
+          <a
+            className="license-link"
+            href="/THIRD_PARTY_NOTICES.txt"
+            target="_blank"
+            title="第三方许可"
+            aria-label="第三方许可"
+          >
+            <CircleHelp size={16} />
+          </a>
+          <button
+            className="export-button"
+            onClick={openExport}
+            disabled={!ready || !sketch.entities.length}
+          >
+            <Download size={15} />
+            导出
+            <ChevronDown size={13} />
+          </button>
+        </div>
+      </header>
+      <nav className="workspace-tabs">
+        <div className="file-menu-wrap">
+          <button
+            className="file-menu-toggle"
+            onClick={() => menuToggle("file")}
+          >
+            <FileJson size={15} />
+            文件
+            <ChevronDown size={12} />
+          </button>
+          {menu === "file" && (
+            <div className="menu file-menu">
+              <MenuItem
+                icon={FilePlus2}
+                label="新建文档"
+                onClick={() => newDocument()}
+              />
+              <MenuItem
+                icon={FolderOpen}
+                label="打开草图"
+                onClick={() => {
+                  fileInput.current?.click();
+                  setMenu(null);
+                }}
+              />
+              <MenuItem
+                icon={Save}
+                label="保存草图"
+                shortcut="Ctrl S"
+                onClick={saveJson}
+              />
+              <div className="menu-divider" />
+              <MenuItem
+                icon={Hexagon}
+                label="打开连接板示例"
+                onClick={() => newDocument(true)}
+              />
+              <MenuItem
+                icon={Download}
+                label="导出 DXF / SVG"
+                onClick={openExport}
+              />
+            </div>
+          )}
+        </div>
+        <button className="workspace-tab selected">草图</button>
+        <div className="tab-spacer" />
+        <IconButton
+          icon={Undo2}
+          title="撤销 (Ctrl+Z)"
+          disabled={!history.current.length}
+          onClick={undo}
+        />
+        <IconButton
+          icon={Redo2}
+          title="重做 (Ctrl+Shift+Z)"
+          disabled={!future.current.length}
+          onClick={redo}
+        />
+        <div className="tab-divider" />
+        <IconButton
+          icon={PanelLeftClose}
+          title="切换浏览器"
+          active={!leftOpen}
+          onClick={() => setLeftOpen(!leftOpen)}
+        />
+        <IconButton
+          icon={PanelRightClose}
+          title="切换属性面板"
+          active={!rightOpen}
+          onClick={() => setRightOpen(!rightOpen)}
+        />
+      </nav>
+      <div className="ribbon">
+        <div className="ribbon-group select-group">
+          <button
+            className={`ribbon-tool ${tool === "select" && !pickOperation ? "selected" : ""}`}
+            onClick={() => setMode("select")}
+            title="选择"
+          >
+            <MousePointer2 size={25} />
+            <span>选择</span>
+          </button>
+          <span className="group-caption">选择</span>
+        </div>
+        <div className="ribbon-group create-group">
+          <div className="ribbon-tools">
+            {(
+              [
+                "line",
+                "rectangle",
+                "circle",
+                "arc",
+                "spline",
+                "polygon",
+              ] as Tool[]
+            ).map((mode) => {
+              const Icon = toolIcons[mode];
+              return (
+                <button
+                  key={mode}
+                  className={`ribbon-tool ${tool === mode ? "selected" : ""}`}
+                  title={toolLabels[mode]}
+                  aria-label={toolLabels[mode]}
+                  onClick={() => openToolConfig(mode)}
+                >
+                  <Icon size={25} />
+                  <span>
+                    {
+                      (
+                        {
+                          line: "直线",
+                          rectangle: "矩形",
+                          circle: "圆",
+                          arc: "圆弧",
+                          spline: "样条",
+                          polygon: "多边形",
+                        } as Record<string, string>
+                      )[mode]
+                    }
+                  </span>
+                </button>
+              );
+            })}
+          </div>
+          <button
+            className={`group-caption dropdown-caption ${menu === "create" ? "open" : ""}`}
+            onClick={() => menuToggle("create")}
+          >
+            创建
+            <ChevronDown size={12} />
+          </button>
+          {menu === "create" && (
+            <div className="menu ribbon-menu create-menu">
+              {(Object.keys(toolLabels) as Tool[])
+                .filter((m) => m !== "select")
+                .map((m) => (
+                  <MenuItem
+                    key={m}
+                    icon={toolIcons[m]}
+                    label={toolLabels[m]}
+                    shortcut={m === "line" ? "L" : undefined}
+                    onClick={() => openToolConfig(m)}
+                  />
+                ))}
+              <div className="menu-divider" />
+              {["mirror", "rectangularArray", "circularArray"].map((op) => (
+                <MenuItem
+                  key={op}
+                  icon={operationIcons[op]}
+                  label={operationNames[op]}
+                  onClick={() => startOperation(op)}
+                />
+              ))}
+            </div>
+          )}
+        </div>
+        <div className="ribbon-group modify-group">
+          <div className="ribbon-tools">
+            {["fillet", "trim", "offset", "move"].map((op) => {
+              const Icon = operationIcons[op];
+              return (
+                <button
+                  key={op}
+                  className={`ribbon-tool ${pickOperation === op ? "selected" : ""}`}
+                  title={operationNames[op]}
+                  onClick={() => startOperation(op)}
+                >
+                  <Icon size={25} />
+                  <span>{operationNames[op]}</span>
+                </button>
+              );
+            })}
+          </div>
+          <button
+            className={`group-caption dropdown-caption ${menu === "modify" ? "open" : ""}`}
+            onClick={() => menuToggle("modify")}
+          >
+            修改
+            <ChevronDown size={12} />
+          </button>
+          {menu === "modify" && (
+            <div className="menu ribbon-menu">
+              {[
+                "fillet",
+                "chamfer",
+                "blend",
+                "offset",
+                "trim",
+                "extend",
+                "break",
+                "scale",
+                "move",
+                "rotate",
+                "copy",
+                "detach",
+              ].map((op) => (
+                <MenuItem
+                  key={op}
+                  icon={operationIcons[op]}
+                  label={operationNames[op]}
+                  onClick={() => startOperation(op)}
+                />
+              ))}
+              <div className="menu-divider" />
+              <MenuItem
+                icon={SlidersHorizontal}
+                label="更改参数"
+                onClick={openParameters}
+              />
+            </div>
+          )}
+        </div>
+        <div className="ribbon-group dimension-group">
+          <button
+            className={`ribbon-tool ${dimensionMode ? "selected" : ""}`}
+            title="草图尺寸 (D)"
+            aria-pressed={dimensionMode}
+            onClick={() => startDimension()}
+          >
+            <Ruler size={26} />
+            <span>尺寸</span>
+          </button>
+          <span className="group-caption">标注</span>
+        </div>
+        <div className="ribbon-group constraints-group">
+          <div className="constraint-ribbon">
+            {constraintKinds.slice(0, 10).map((kind) => (
+              <IconButton
+                key={kind}
+                icon={constraintIcons[kind]}
+                title={constraintLabels[kind]}
+                disabled={
+                  !ready ||
+                  !!canConstrain(sketch, kind, refs) ||
+                  selectedEntities.some((e) => e.sourceId)
+                }
+                onClick={() => addConstraint(kind)}
+              />
+            ))}
+          </div>
+          <button
+            className="group-caption dropdown-caption"
+            onClick={() => menuToggle("constraints")}
+          >
+            约束
+            <ChevronDown size={12} />
+          </button>
+          {menu === "constraints" && (
+            <div className="menu ribbon-menu">
+              {constraintKinds.map((kind) => (
+                <MenuItem
+                  key={kind}
+                  icon={constraintIcons[kind]}
+                  label={constraintLabels[kind]}
+                  disabled={!!canConstrain(sketch, kind, refs)}
+                  onClick={() => {
+                    addConstraint(kind);
+                    setMenu(null);
+                  }}
+                />
+              ))}
+            </div>
+          )}
+        </div>
+        <div className="ribbon-end">
+          <button
+            className="construction-button"
+            title="构造几何"
+            aria-label="构造几何"
+            aria-pressed={config.construction}
+            onClick={() => {
+              if (selection.length)
+                transaction("构造几何", (_, s) => {
+                  for (const e of s.entities)
+                    if (selection.some((p) => p.entityId === e.id))
+                      e.construction = !e.construction;
+                });
+              else setConfig({ ...config, construction: !config.construction });
+            }}
+          >
+            <CircleDashed size={22} />
+            <span>构造</span>
+          </button>
+        </div>
+      </div>
+      <main className="work-area">
+        <aside className="browser-panel">
+          <div className="panel-heading">
+            <span>浏览器</span>
+            <IconButton
+              icon={Plus}
+              title="新建草图"
+              disabled={!ready}
+              onClick={createSketch}
+            />
+          </div>
+          <div className="tree-document">
+            <ChevronDown size={13} />
+            <FileJson size={16} />
+            <strong>{doc.name || "未命名草图"}</strong>
+          </div>
+          <div className="document-settings">
+            <Settings2 size={14} />
+            <span>文档设置</span>
+          </div>
+          <div className="unit-setting">
+            <Ruler size={14} />
+            <span>单位</span>
+            <select
+              aria-label="单位"
+              value={doc.unit}
+              onChange={(e) =>
+                transaction("切换单位", (candidate) => {
+                  candidate.unit = e.target.value as "mm" | "in";
+                })
+              }
+            >
+              <option value="mm">毫米</option>
+              <option value="in">英寸</option>
+            </select>
+          </div>
+          <div className="tree-section">
+            <Crosshair size={14} />
+            <span>原点</span>
+            <span className="subtle">XY</span>
+          </div>
+          <div className="tree-section">
+            <Rows3 size={14} />
+            <span>草图</span>
+            <span className="count-badge">{doc.sketches.length}</span>
+          </div>
+          <div className="sketch-tree">
+            {doc.sketches.map((s) => (
+              <div
+                key={s.id}
+                className={`sketch-row ${s.id === activeId ? "current" : ""}`}
+              >
+                <button
+                  className="sketch-name"
+                  onClick={() => {
+                    setActiveId(s.id);
+                    setSelection([]);
+                    cancel();
+                  }}
+                >
+                  <ChevronRight size={12} />
+                  <Pencil size={14} />
+                  <span>{s.name}</span>
+                </button>
+                <IconButton
+                  icon={s.visible ? Eye : EyeOff}
+                  title={`${s.visible ? "隐藏" : "显示"}${s.name}`}
+                  onClick={() =>
+                    transaction("草图可见性", (candidate) => {
+                      candidate.sketches.find((sk) => sk.id === s.id)!.visible =
+                        !s.visible;
+                    })
+                  }
+                />
+              </div>
+            ))}
+          </div>
+          <div className="entity-list-heading">
+            <span>几何对象</span>
+            <span>{sketch.entities.length}</span>
+          </div>
+          <div className="entity-list">
+            {sketch.entities.map((e, i) => {
+              const Icon =
+                toolIcons[
+                  (e.kind === "line"
+                    ? "line"
+                    : e.kind === "circle"
+                      ? "circle"
+                      : e.kind === "arc"
+                        ? "arc"
+                        : e.kind === "ellipse"
+                          ? "ellipse"
+                          : e.kind === "spline"
+                            ? "spline"
+                            : e.kind === "bezier"
+                              ? "bezier"
+                              : e.kind === "conic"
+                                ? "conic"
+                                : e.kind === "point"
+                                  ? "point"
+                                  : "text") as Tool
+                ];
+              return (
+                <button
+                  key={e.id}
+                  className={`entity-row ${selection.some((s) => s.entityId === e.id) ? "selected" : ""}`}
+                  title={e.sourceId ? "关联副本" : e.name}
+                  onClick={(event) =>
+                    select(
+                      { entityId: e.id },
+                      event.ctrlKey || event.metaKey || event.shiftKey,
+                    )
+                  }
+                  onDoubleClick={() => editEntity(e)}
+                >
+                  <Icon size={14} />
+                  <span>{e.name}</span>
+                  {e.sourceId ? (
+                    <GitBranch size={12} />
+                  ) : e.construction ? (
+                    <CircleDashed size={12} />
+                  ) : (
+                    <small>{String(i + 1).padStart(2, "0")}</small>
+                  )}
+                </button>
+              );
+            })}
+          </div>
+          <div className="browser-footer">
+            <span className="plane-dot" />
+            XY 平面<span>2D</span>
+          </div>
+        </aside>
+        <div className="canvas-container">
+          <Viewport
+            sketches={doc.sketches}
+            activeId={activeId}
+            selection={selection}
+            tool={tool}
+            drafts={drafts}
+            config={config}
+            grid={grid}
+            snap={snap}
+            snapOptions={snapOptions}
+            fitKey={fitKey}
+            unit={doc.unit}
+            onPlace={place}
+            onSelect={select}
+            onBox={(ids, additive) =>
+              setSelection((prev) => {
+                const next = ids.map((entityId) => ({ entityId }));
+                return additive
+                  ? [...prev.filter((p) => !ids.includes(p.entityId)), ...next]
+                  : next;
+              })
+            }
+            onCursor={setCursor}
+            onDrag={drag}
+            onFinish={(point, snapRef) => {
+              if (tool === "spline") finishSpline(point, snapRef);
+              else {
+                setDrafts([]);
+                draftSnaps.current = [];
+                draftCaptured.current = false;
+              }
+            }}
+            onEditConstraint={(id) => {
+              const c = sketch.constraints.find((c) => c.id === id);
+              if (c) openDimensionInput(c.kind, c.refs, { existingId: c.id });
+            }}
+            pickOperation={pickOperation}
+            onPickOperation={(entityId, p) =>
+              runOperation(pickOperation!, {}, p, entityId)
+            }
+            pickDimension={dimensionMode}
+            dimensionPicks={dimensionPicks}
+            dimensionKindMode={dimensionKindMode}
+            dimensionGuides={
+              dimensionMode && !dimensionDraft
+                ? (dimensionPicks
+                    .filter((ref) => resolveEntity(sketch, ref)?.id !== ref)
+                    .map((ref) => referencePoint(sketch, ref))
+                    .filter(Boolean) as XY[])
+                : []
+            }
+            dimensionDraft={dimensionDraft}
+            dimensionAdjustment={dimensionAdjustment}
+            onDimensionAdjust={adjustDimension}
+            onDimensionPositionCommit={commitDimensionPosition}
+            onDimensionPick={pickDimension}
+            onDimensionCommit={commitDimension}
+            onDimensionCancel={cancelDimensions}
+          />
+          {!ready && (
+            <div className="loading-overlay">
+              <LoaderCircle size={23} className="spin" />
+              <span>加载几何求解器</span>
+            </div>
+          )}
+        </div>
+        <aside className="properties-panel">
+          <div className="panel-heading">
+            <span>草图选项</span>
+            <Settings2 size={16} />
+          </div>
+          <div className="option-list">
+            <label>
+              <span>
+                <Grid3X3 size={15} />
+                网格
+              </span>
+              <input
+                type="checkbox"
+                checked={grid}
+                onChange={(e) => setGrid(e.target.checked)}
+              />
+            </label>
+            <label>
+              <span>
+                <Magnet size={15} />
+                吸附
+              </span>
+              <input
+                type="checkbox"
+                checked={snap}
+                onChange={(e) => setSnap(e.target.checked)}
+              />
+            </label>
+            <label>
+              <span>
+                <GitMerge size={15} />
+                自动约束
+              </span>
+              <input
+                type="checkbox"
+                checked={config.autoConstraint}
+                onChange={(e) =>
+                  setConfig({ ...config, autoConstraint: e.target.checked })
+                }
+              />
+            </label>
+            <label>
+              <span>
+                <CircleDashed size={15} />
+                构造几何
+              </span>
+              <input
+                type="checkbox"
+                checked={config.construction}
+                onChange={(e) =>
+                  setConfig({ ...config, construction: e.target.checked })
+                }
+              />
+            </label>
+          </div>
+          <div className="section-heading">
+            <span>属性</span>
+            {one && (
+              <IconButton
+                icon={Pencil}
+                title="编辑对象属性"
+                onClick={() => editEntity(one)}
+              />
+            )}
+          </div>
+          <div className="property-content">
+            {selection.length ? (
+              <>
+                <div className="property-title">
+                  {selection.length === 1
+                    ? selection[0].pointId
+                      ? "控制点"
+                      : one?.name
+                    : `${selectedEntities.length} 个对象`}
+                  <span className="property-chip">
+                    {selection[0]?.pointId
+                      ? "点"
+                      : one
+                        ? kindLabels[one.kind]
+                        : "多选"}
+                  </span>
+                </div>
+                {one && (
+                  <>
+                    <div className="property-row">
+                      <span>X</span>
+                      <strong>
+                        {formatted(one.points[0].x)}
+                        <small>{unit}</small>
+                      </strong>
+                    </div>
+                    <div className="property-row">
+                      <span>Y</span>
+                      <strong>
+                        {formatted(one.points[0].y)}
+                        <small>{unit}</small>
+                      </strong>
+                    </div>
+                    {one.kind === "line" && (
+                      <div className="property-row">
+                        <span>长度</span>
+                        <strong>
+                          {formatted(dist(one.points[0], one.points[1]))}
+                          <small>{unit}</small>
+                        </strong>
+                      </div>
+                    )}
+                    {(one.kind === "circle" || one.kind === "arc") && (
+                      <div className="property-row">
+                        <span>半径</span>
+                        <strong>
+                          {formatted(
+                            one.kind === "arc"
+                              ? arcInfo(one).r
+                              : (one.radius ?? 0),
+                          )}
+                          <small>{unit}</small>
+                        </strong>
+                      </div>
+                    )}
+                    {one.sourceId && (
+                      <div className="derived-note">
+                        <GitBranch size={14} />
+                        关联几何
+                        <IconButton
+                          icon={Unlink}
+                          title="解除关联"
+                          onClick={() => startOperation("detach")}
+                        />
+                      </div>
+                    )}
+                  </>
+                )}
+                <div className="selection-actions">
+                  <button
+                    className="button small"
+                    onClick={() => startDimension()}
+                  >
+                    <Ruler size={14} />
+                    尺寸
+                  </button>
+                  <IconButton
+                    icon={Trash2}
+                    title="删除选中对象"
+                    onClick={removeSelected}
+                  />
+                </div>
+              </>
+            ) : (
+              <div className="empty-selection">
+                <MousePointer2 size={21} />
+                <span>未选择对象</span>
+              </div>
+            )}
+          </div>
+          <div className="section-heading">
+            <span>几何约束</span>
+            <span className="count-badge">{sketch.constraints.length}</span>
+          </div>
+          <div className="constraint-grid">
+            {constraintKinds.map((kind) => (
+              <IconButton
+                key={kind}
+                icon={constraintIcons[kind]}
+                title={constraintLabels[kind]}
+                disabled={
+                  !ready ||
+                  !!canConstrain(sketch, kind, refs) ||
+                  selectedEntities.some((e) => e.sourceId)
+                }
+                onClick={() => addConstraint(kind)}
+              />
+            ))}
+          </div>
+          <div className="dimension-select">
+            <select
+              aria-label="尺寸类型"
+              value={dimensionKindMode}
+              onChange={(e) => {
+                const mode = e.target.value as DimensionPickMode;
+                setDimensionKindMode(mode);
+                setDimensionPicks([]);
+                setDimensionDraft(null);
+                startDimension(mode);
+              }}
+            >
+              <option value="auto">自动</option>
+              {(
+                [
+                  "length",
+                  "lineDistance",
+                  "distanceX",
+                  "distanceY",
+                  "radius",
+                  "diameter",
+                  "angle",
+                ] as ConstraintKind[]
+              ).map((kind) => (
+                <option key={kind} value={kind}>
+                  {constraintLabels[kind]}
+                </option>
+              ))}
+            </select>
+            <IconButton
+              icon={Ruler}
+              title="添加尺寸"
+              active={dimensionMode}
+              onClick={() => startDimension()}
+            />
+          </div>
+          <div className="constraint-list">
+            {sketch.constraints
+              .filter(
+                (c) =>
+                  !selection.length ||
+                  c.refs.some((r) =>
+                    selection.some(
+                      (s) =>
+                        s.entityId === r ||
+                        s.pointId === r ||
+                        sketch.entities
+                          .find((e) => e.id === s.entityId)
+                          ?.points.some((p) => p.id === r),
+                    ),
+                  ),
+              )
+              .map((c) => {
+                const Icon = constraintIcons[c.kind];
+                return (
+                  <div
+                    key={c.id}
+                    className={`constraint-row ${solverState.conflicting.includes(c.id) ? "conflict" : ""}`}
+                  >
+                    <Icon size={13} />
+                    <button
+                      title="定位约束"
+                      onClick={() =>
+                        setSelection(
+                          c.refs
+                            .map((r) => {
+                              const e = resolveEntity(sketch, r);
+                              return e
+                                ? {
+                                    entityId: e.id,
+                                    pointId: e.id === r ? undefined : r,
+                                  }
+                                : undefined;
+                            })
+                            .filter(Boolean) as Selection[],
+                        )
+                      }
+                    >
+                      {constraintLabels[c.kind]}
+                    </button>
+                    {c.value !== undefined && (
+                      <button
+                        className="constraint-value"
+                        title="编辑尺寸"
+                        onClick={() =>
+                          openDimensionInput(c.kind, c.refs, {
+                            existingId: c.id,
+                          })
+                        }
+                      >
+                        {c.expression ??
+                          (c.kind === "angle"
+                            ? `${Number(c.value.toFixed(2))}°`
+                            : formatted(c.value))}
+                      </button>
+                    )}
+                    <IconButton
+                      icon={X}
+                      title={`移除${constraintLabels[c.kind]}约束`}
+                      onClick={() =>
+                        transaction("移除约束", (_, s) => {
+                          s.constraints = s.constraints.filter(
+                            (item) => item.id !== c.id,
+                          );
+                        })
+                      }
+                    />
+                  </div>
+                );
+              })}
+          </div>
+          <div className="parameter-footer">
+            <button onClick={openParameters}>
+              <SlidersHorizontal size={15} />
+              参数<span>{doc.parameters.length}</span>
+            </button>
+          </div>
+        </aside>
+      </main>
+      <div className="bottom-strip">
+        <div className="sketch-tabs">
+          {doc.sketches.map((s) => (
+            <button
+              key={s.id}
+              className={s.id === activeId ? "active" : ""}
+              onClick={() => {
+                setActiveId(s.id);
+                setSelection([]);
+                cancel();
+              }}
+            >
+              <Pencil size={12} />
+              {s.name}
+            </button>
+          ))}
+          <IconButton icon={Plus} title="添加草图" onClick={createSketch} />
+        </div>
+        <div className="bottom-actions">
+          <IconButton
+            icon={Maximize2}
+            title="适配全部"
+            onClick={() => setFitKey((v) => v + 1)}
+          />
+          {(
+            [
+              ["grid", Grid3X3, "网格捕获"],
+              ["midpoint", Triangle, "中点捕获"],
+              ["endpoint", CircleDot, "端点捕获"],
+              ["tangent", Tangent, "切点捕获"],
+              ["intersection", Crosshair, "相交点捕获"],
+            ] as const
+          ).map(([kind, Icon, title]) => (
+            <IconButton
+              key={kind}
+              icon={Icon}
+              title={title}
+              active={snapOptions[kind]}
+              onClick={() =>
+                setSnapOptions((current) => ({
+                  ...current,
+                  [kind]: !current[kind],
+                }))
+              }
+            />
+          ))}
+          <IconButton
+            icon={Magnet}
+            title="切换吸附"
+            active={snap}
+            onClick={() => setSnap(!snap)}
+          />
+        </div>
+      </div>
+      <footer className="status-bar">
+        <div className={`solver-status ${ready ? "" : "loading"}`}>
+          <span
+            className={`status-dot ${solverState.conflicting.length ? "error" : solverState.dof === 0 ? "complete" : ""}`}
+          />
+          {!ready
+            ? "求解器加载中"
+            : solverState.conflicting.length
+              ? "约束冲突 · 操作未提交"
+              : solverState.dof === 0
+                ? "完全约束"
+                : `欠约束 · ${solverState.dof} 自由度`}
+        </div>
+        <span className="tool-status">
+          {dimensionDraft
+            ? `${constraintLabels[dimensionDraft.kind]}：输入数值后按 Enter`
+            : dimensionAdjustment
+              ? "尺寸：调整标注位置"
+              : dimensionMode
+                ? dimensionRequest?.complete
+                  ? dimensionPicks.length === 1 && dimensionKindMode === "auto"
+                    ? "尺寸：定位标注 / 第二个对象"
+                    : "尺寸：定位标注"
+                  : dimensionPicks.length
+                    ? dimensionKindMode === "angle"
+                      ? "尺寸：请选择第二条线"
+                      : dimensionKindMode === "lineDistance"
+                        ? "尺寸：请选择直线或点"
+                        : "尺寸：请选择第二个点"
+                    : "尺寸：点击几何或点"
+                : pickOperation
+                  ? operationNames[pickOperation]
+                  : toolLabels[tool]}
+          {drafts.length ? ` · ${drafts.length}` : ""}
+        </span>
+        <div className="status-right">
+          <span>
+            X <strong>{formatted(cursor.x)}</strong>
+          </span>
+          <span>
+            Y <strong>{formatted(cursor.y)}</strong>
+          </span>
+          <span>{unit}</span>
+          <span className="status-separator" />
+          <span>{sketch.entities.length} 对象</span>
+        </div>
+      </footer>
+      {menu && <div className="menu-dismiss" onClick={() => setMenu(null)} />}
+      {modal && (
+        <ModalView
+          key={modal.title + modal.fields.map((f) => f.value).join("|")}
+          modal={modal}
+          onClose={() => setModal(null)}
+        />
+      )}
+      <input
+        ref={fileInput}
+        type="file"
+        accept=".json,.sketch.json"
+        hidden
+        onChange={async (e) => {
+          const file = e.target.files?.[0];
+          if (!file) return;
+          try {
+            if (file.size > 10_000_000) throw new Error("文件超过 10 MB");
+            const next = validateDocument(JSON.parse(await file.text()));
+            if (commit(next, "打开草图")) {
+              setActiveId(next.sketches[0].id);
+              setSelection([]);
+              setFitKey((v) => v + 1);
+              cancel();
+              notify("草图已打开");
+            }
+          } catch (error) {
+            notify((error as Error).message, true);
+          }
+          e.target.value = "";
+        }}
+      />
+      {toast && (
+        <div className={`toast ${toast.error ? "error" : ""}`} role="status">
+          {toast.error ? <AlertTriangle size={17} /> : <Check size={17} />}
+          <span>{toast.text}</span>
+          <IconButton
+            icon={X}
+            title="关闭通知"
+            onClick={() => setToast(null)}
+          />
+        </div>
+      )}
+    </div>
+  );
+}
