@@ -548,9 +548,9 @@ export function demoDocument(): Document {
       s.entities.push(e);
       s.constraints.push({
         id: uid("c"),
-        kind: "radius",
+        kind: "diameter",
         refs: [e.id],
-        value: 5,
+        value: 10,
       });
     }
   s.entities.push(

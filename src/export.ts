@@ -251,8 +251,14 @@ export function exportSvg(doc: Document, options: ExportOptions = {}): string {
 export function exportJson(doc: Document): string {
   return JSON.stringify(doc, null, 2);
 }
-export function download(name: string, contents: string, mime: string): void {
-  const url = URL.createObjectURL(new Blob([contents], { type: mime }));
+export function download(
+  name: string,
+  contents: string | Uint8Array,
+  mime: string,
+): void {
+  const data =
+    typeof contents === "string" ? contents : new Uint8Array(contents);
+  const url = URL.createObjectURL(new Blob([data], { type: mime }));
   const link = document.createElement("a");
   link.href = url;
   link.download = name;

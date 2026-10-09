@@ -426,7 +426,9 @@ async function parameterChecks() {
       const arrayPanel = page.getByTestId("parameter-panel");
       await arrayPanel.waitFor();
       assert.equal(
-        (await arrayPanel.locator(".geometry-pick span").first().innerText()).trim(),
+        (
+          await arrayPanel.locator(".geometry-pick span").first().innerText()
+        ).trim(),
         "已选择 1 个",
         "the preselected object fills the 对象 parameter",
       );
@@ -666,7 +668,9 @@ try {
     const fixPanel = page.getByTestId("parameter-panel");
     await fixPanel.waitFor();
     assert.notEqual(
-      (await fixPanel.locator(".geometry-pick span").first().innerText()).trim(),
+      (
+        await fixPanel.locator(".geometry-pick span").first().innerText()
+      ).trim(),
       "选择",
       "the fixed constraint preselects the object",
     );
@@ -687,7 +691,7 @@ try {
   await check("JSON save download and localStorage reload", async () => {
     const text = await download(async () => {
       await button("文件").click();
-      await button("保存草图 Ctrl S").click();
+      await button("导出 JSON 草图").click();
     }, "document.sketch.json");
     const downloaded = JSON.parse(text);
     const previous = await saved();
@@ -814,9 +818,13 @@ try {
   await advancedChecks();
   await check("Default demo desktop and mobile screenshots", async () => {
     await page.setViewportSize({ width: 1440, height: 900 });
-    await page.evaluate((key) => localStorage.removeItem(key), storage);
-    await page.reload();
-    await page.locator(".loading-overlay").waitFor({ state: "hidden" });
+    await button("文件").click();
+    await button("打开连接板示例").click();
+    await page
+      .locator(".dialog")
+      .getByRole("button", { name: "打开示例", exact: true })
+      .click();
+    await page.locator(".dialog").waitFor({ state: "detached" });
     const initial = geometry(await saved());
     assert.equal(initial.entities.length, 11);
     await compactCanvasOverlays();

@@ -1,3 +1,4 @@
+import { circularDimensionEndpoints } from "./circularDimension";
 import RBush from "rbush";
 import {
   type Constraint,
@@ -924,19 +925,15 @@ export class CanvasRenderer {
                   : dist(point, foot);
           } else if (c.kind === "radius" || c.kind === "diameter") {
             const center = e.points[0],
-              r = e.kind === "arc" ? arcInfo(e).r : (e.radius ?? 1);
-            a = screen(center);
-            b = screen({
-              x: center.x + r * Math.SQRT1_2,
-              y: center.y + r * Math.SQRT1_2,
-            });
-            if (placed) {
-              const length = dist(a, placed) || 1;
-              b = {
-                x: a.x + ((placed.x - a.x) / length) * r * frame.view.scale,
-                y: a.y + ((placed.y - a.y) / length) * r * frame.view.scale,
-              };
-            }
+              r = e.kind === "arc" ? arcInfo(e).r : (e.radius ?? 1),
+              endpoints = circularDimensionEndpoints(
+                center,
+                r,
+                c.kind,
+                placement,
+              );
+            a = screen(endpoints.a);
+            b = screen(endpoints.b);
             label = placed ?? { x: b.x + 18, y: b.y - 15 };
             if (c.value === undefined)
               value = r * (c.kind === "diameter" ? 2 : 1);

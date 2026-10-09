@@ -24,6 +24,7 @@ import { bounds, dist } from "./geometry";
 import { dimensionLabelAnchor, dimensionReferences } from "./dimensionLabel";
 import { resolveBodyDragEntities } from "./dragTransaction";
 import { appendSplinePoint } from "./splineDraft";
+import { connectedContour } from "./connectedSelection";
 import {
   defaultSnapOptions,
   isSnapEnabled,
@@ -1043,6 +1044,26 @@ export function Viewport(props: ViewportProps) {
           } else if (current.tool === "spline" && current.drafts.length >= 2) {
             event.preventDefault();
             current.onFinish();
+          } else if (
+            current.tool === "select" &&
+            !current.pickDimension &&
+            !current.dimensionDraft
+          ) {
+            const sketch = current.sketches.find(
+                (sketch) => sketch.id === current.activeId && sketch.visible,
+              ),
+              hit = renderer.current!.hitTest(point, frame());
+            if (!sketch || !hit) return;
+            event.preventDefault();
+            current.onBox(
+              connectedContour(
+                sketch,
+                hit.entityId,
+                event.ctrlKey || event.metaKey,
+                toWorld(point),
+              ),
+              event.ctrlKey || event.metaKey || event.shiftKey,
+            );
           }
         }}
       />

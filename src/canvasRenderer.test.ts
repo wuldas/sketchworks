@@ -690,6 +690,8 @@ describe("retained Canvas renderer", () => {
     r.draw(canvas, f);
     expect(r.dimensionAnchor("diameter")).toEqual({ x: 460, y: 300 });
     expect(r.dimensionAt({ x: 430, y: 300 }, f, true)).toBe("diameter");
+    expect(r.dimensionAt({ x: 390, y: 300 }, f, true)).toBe("diameter");
+    expect(r.dimensionAt({ x: 380, y: 300 }, f, true)).toBe("diameter");
     expect(r.metadata(f).dimensions[0].text).toBe("\u00d810");
   });
   it("uses the saved label position after reload, pan and zoom", () => {

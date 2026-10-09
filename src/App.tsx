@@ -120,6 +120,16 @@ import {
 } from "./parameters";
 import { exportDxf, exportSvg, exportJson, download } from "./export";
 import { Viewport } from "./Viewport";
+import { FileManager } from "./FileManager";
+import {
+  createProject,
+  decodeProject,
+  encodeProject,
+  projectFileName,
+  type CadProject,
+} from "./projectArchive";
+import { virtualFiles, ROOT_ID, type VfsFileEntry } from "./virtualFileSystem";
+import { useProjectWorkspace } from "./useProjectWorkspace";
 import { appendSplinePoint } from "./splineDraft";
 import {
   defaultSnapOptions,
@@ -254,7 +264,7 @@ interface Field {
 interface Modal {
   title: string;
   fields: Field[];
-  confirm: (values: Record<string, string>) => boolean;
+  confirm: (values: Record<string, string>) => boolean | Promise<boolean>;
   description?: string;
   submit?: string;
 }
@@ -287,6 +297,7 @@ function IconButton({
   );
 }
 function ModalView({ modal, onClose }: { modal: Modal; onClose: () => void }) {
+  const [pending, setPending] = useState(false);
   const [values, setValues] = useState<Record<string, string>>(() =>
     Object.fromEntries(modal.fields.map((f) => [f.key, f.value])),
   );
@@ -294,19 +305,31 @@ function ModalView({ modal, onClose }: { modal: Modal; onClose: () => void }) {
     <div
       className="modal-shade"
       onPointerDown={(e) => {
-        if (e.target === e.currentTarget) onClose();
+        if (!pending && e.target === e.currentTarget) onClose();
       }}
     >
       <form
         className="dialog"
-        onSubmit={(e) => {
+        aria-busy={pending}
+        onSubmit={async (e) => {
           e.preventDefault();
-          if (modal.confirm(values)) onClose();
+          if (pending) return;
+          setPending(true);
+          try {
+            if (await modal.confirm(values)) onClose();
+          } finally {
+            setPending(false);
+          }
         }}
       >
         <div className="dialog-title">
           <h2>{modal.title}</h2>
-          <IconButton icon={X} title="关闭对话框" onClick={onClose} />
+          <IconButton
+            icon={X}
+            title="关闭对话框"
+            disabled={pending}
+            onClick={onClose}
+          />
         </div>
         {modal.description && (
           <div className="dialog-warning">{modal.description}</div>
@@ -319,6 +342,7 @@ function ModalView({ modal, onClose }: { modal: Modal; onClose: () => void }) {
                 {f.type === "select" ? (
                   <select
                     aria-label={f.label}
+                    disabled={pending}
                     value={values[f.key]}
                     onChange={(e) =>
                       setValues({ ...values, [f.key]: e.target.value })
@@ -332,6 +356,7 @@ function ModalView({ modal, onClose }: { modal: Modal; onClose: () => void }) {
                   <textarea
                     autoFocus={i === 0}
                     aria-label={f.label}
+                    disabled={pending}
                     value={values[f.key]}
                     onChange={(e) =>
                       setValues({ ...values, [f.key]: e.target.value })
@@ -342,6 +367,7 @@ function ModalView({ modal, onClose }: { modal: Modal; onClose: () => void }) {
                   <input
                     autoFocus={i === 0}
                     aria-label={f.label}
+                    disabled={pending}
                     value={values[f.key]}
                     onChange={(e) =>
                       setValues({ ...values, [f.key]: e.target.value })
@@ -355,10 +381,15 @@ function ModalView({ modal, onClose }: { modal: Modal; onClose: () => void }) {
           ))}
         </div>
         <div className="dialog-actions">
-          <button type="button" className="button" onClick={onClose}>
+          <button
+            type="button"
+            className="button"
+            disabled={pending}
+            onClick={onClose}
+          >
             取消
           </button>
-          <button type="submit" className="button primary">
+          <button type="submit" className="button primary" disabled={pending}>
             <Check size={15} />
             {modal.submit ?? "确定"}
           </button>
@@ -425,6 +456,7 @@ export default function App() {
     [cursor, setCursor] = useState<XY>({ x: 0, y: 0 }),
     [menu, setMenu] = useState<string | null>(null),
     [modal, setModal] = useState<Modal | null>(null),
+    [fileManager, setFileManager] = useState<"browse" | "save" | null>(null),
     [toast, setToast] = useState<{ text: string; error: boolean } | null>(null),
     [saved, setSaved] = useState(false),
     [historyVersion, setHistoryVersion] = useState(0),
@@ -585,18 +617,23 @@ export default function App() {
       alive = false;
     };
   }, []);
+  const workspace = useProjectWorkspace({
+    document: doc,
+    documentRef: docRef,
+    editorReady: ready,
+    notify,
+    onRestore: (project) => {
+      if (!commit(clone(project.document), "恢复项目", false)) return false;
+      history.current = [];
+      future.current = [];
+      switchSketch(docRef.current.sketches[0].id);
+      setFitKey((value) => value + 1);
+      return true;
+    },
+  });
   useEffect(() => {
-    setSaved(false);
-    const timer = setTimeout(() => {
-      try {
-        localStorage.setItem(STORAGE, JSON.stringify(doc));
-        setSaved(true);
-      } catch {
-        notify("本地保存失败，编辑内容仍保留在内存中", true);
-      }
-    }, 600);
-    return () => clearTimeout(timer);
-  }, [doc, notify]);
+    setSaved(workspace.saved);
+  }, [workspace.saved]);
   useEffect(() => {
     const sk = doc.sketches.find((s) => s.id === activeId);
     if (sk && ready) {
@@ -696,6 +733,94 @@ export default function App() {
       cancelDimensions();
     }
   };
+  const openFileManager = (mode: "browse" | "save" = "browse") => {
+    if (!workspace.ready) {
+      notify("项目存储正在打开，请稍后操作", true);
+      return;
+    }
+    cancel();
+    setModal(null);
+    setMenu(null);
+    setFileManager(mode);
+  };
+  const saveProject = async () => {
+    if (!workspace.ready) {
+      notify("项目存储正在打开，请稍后保存", true);
+      return;
+    }
+    if (!workspace.activeFile) {
+      openFileManager("save");
+      return;
+    }
+    try {
+      const entry = await virtualFiles.get(workspace.activeFile.id);
+      if (!entry || entry.kind !== "file") {
+        await workspace.refresh();
+        openFileManager("save");
+        return;
+      }
+      await workspace.persist();
+      notify("项目已保存");
+      setMenu(null);
+    } catch {
+      /* The workspace reports the actual storage error. */
+    }
+  };
+  const downloadProject = () => {
+    if (!workspace.ready) {
+      notify("项目存储正在打开，请稍后下载", true);
+      return;
+    }
+    try {
+      const project = workspace.currentProject();
+      const contents = encodeProject(project);
+      const name = projectFileName(
+        workspace.activeFile?.name ?? docRef.current.name,
+      );
+      download(name, contents, "application/octet-stream");
+      notify("项目已下载");
+      setMenu(null);
+    } catch (error) {
+      notify((error as Error).message, true);
+    }
+  };
+  const openVirtualProject = async (file: VfsFileEntry) => {
+    if (!ready) {
+      notify("求解器正在加载", true);
+      return false;
+    }
+    try {
+      await workspace.persist();
+      const latestFile = await virtualFiles.get(file.id);
+      if (!latestFile || latestFile.kind !== "file")
+        throw new Error("项目文件已不存在");
+      const contents = await virtualFiles.readFile(file.id);
+      const project = /\.json$/i.test(latestFile.name)
+        ? createProject(validateDocument(JSON.parse(await contents.text())))
+        : decodeProject(await contents.arrayBuffer());
+      if (!commit(clone(project.document), "打开项目", false)) return false;
+      history.current = [];
+      future.current = [];
+      setHistoryVersion((value) => value + 1);
+      switchSketch(docRef.current.sketches[0].id);
+      setFitKey((value) => value + 1);
+      workspace.attach({ ...latestFile, kind: "file" }, project);
+      notify("项目已打开");
+      return true;
+    } catch (error) {
+      notify(`打开项目失败：${(error as Error).message}`, true);
+      return false;
+    }
+  };
+  const saveVirtualProject = (file: VfsFileEntry, project: CadProject) => {
+    workspace.attach(file, project);
+    notify("项目已保存到文件管理器");
+  };
+  const refreshVirtualFiles = () => {
+    void workspace
+      .refresh()
+      .catch((error) => notify((error as Error).message, true));
+  };
   const saveJson = () => {
     download(`${doc.name}.sketch.json`, exportJson(doc), "application/json");
     notify("草图文件已下载");
@@ -703,7 +828,11 @@ export default function App() {
   };
   useEffect(() => {
     const handler = (e: KeyboardEvent) => {
-      if ((e.target as HTMLElement)?.matches("input,textarea,select") || modal)
+      if (
+        (e.target as HTMLElement)?.matches("input,textarea,select") ||
+        modal ||
+        fileManager
+      )
         return;
       const key = e.key.toLowerCase();
       if (command) {
@@ -731,9 +860,13 @@ export default function App() {
       } else if ((e.ctrlKey || e.metaKey) && key === "y") {
         e.preventDefault();
         redo();
+      } else if ((e.ctrlKey || e.metaKey) && key === "o") {
+        e.preventDefault();
+        openFileManager("browse");
       } else if ((e.ctrlKey || e.metaKey) && key === "s") {
         e.preventDefault();
-        saveJson();
+        if (e.shiftKey) openFileManager("save");
+        else void saveProject();
       } else if ((e.ctrlKey || e.metaKey) && key === "a") {
         e.preventDefault();
         setSelection(sketch.entities.map((e) => ({ entityId: e.id })));
@@ -1621,7 +1754,7 @@ export default function App() {
           label: "文件格式",
           value: "DXF",
           type: "select",
-          options: ["DXF", "SVG"],
+          options: ["DXF", "SVG", "PDF"],
         },
         {
           key: "scope",
@@ -1640,7 +1773,7 @@ export default function App() {
         { key: "name", label: "文件名", value: doc.name, type: "text" },
       ],
       submit: "导出",
-      confirm: (values) => {
+      confirm: async (values) => {
         try {
           if (!ready) throw new Error("求解器未就绪");
           const output = clone(docRef.current);
@@ -1661,15 +1794,21 @@ export default function App() {
             )
           )
             throw new Error("没有可导出的几何");
-          const isDxf = values.format === "DXF";
-          const content = isDxf
-            ? exportDxf(output, options)
-            : exportSvg(output, options);
-          download(
-            `${values.name}.${isDxf ? "dxf" : "svg"}`,
-            content,
-            isDxf ? "application/dxf" : "image/svg+xml",
-          );
+          if (values.format === "PDF") {
+            const { exportPdf } = await import("./pdfExport");
+            const content = await exportPdf(output, options);
+            download(`${values.name}.pdf`, content, "application/pdf");
+          } else {
+            const isDxf = values.format === "DXF";
+            const content = isDxf
+              ? exportDxf(output, options)
+              : exportSvg(output, options);
+            download(
+              `${values.name}.${isDxf ? "dxf" : "svg"}`,
+              content,
+              isDxf ? "application/dxf" : "image/svg+xml",
+            );
+          }
           notify(`${values.format} 已导出`);
           return true;
         } catch (error) {
@@ -1737,15 +1876,25 @@ export default function App() {
         },
       ],
       submit: demo ? "打开示例" : "新建",
-      confirm: (values) => {
-        const next = demo ? demoDocument() : emptyDocument();
-        next.name = values.name.trim() || "未命名草图";
-        if (commit(next, "新建")) {
-          switchSketch(next.sketches[0].id);
-          setFitKey((v) => v + 1);
-          return true;
+      confirm: async (values) => {
+        try {
+          await workspace.persist();
+          const next = demo ? demoDocument() : emptyDocument();
+          next.name = values.name.trim() || "未命名草图";
+          if (commit(next, "新建", false)) {
+            history.current = [];
+            future.current = [];
+            setHistoryVersion((value) => value + 1);
+            workspace.detach(docRef.current);
+            switchSketch(next.sketches[0].id);
+            setFitKey((v) => v + 1);
+            return true;
+          }
+          return false;
+        } catch (error) {
+          notify(`未替换当前项目：${(error as Error).message}`, true);
+          return false;
         }
-        return false;
       },
     });
   };
@@ -1818,14 +1967,12 @@ export default function App() {
       return;
     }
     const fields: Field[] = [{ key: "name", label: "名称", value: e.name }];
-    if (e.kind === "circle" || e.kind === "arc")
+    if (e.kind === "circle")
       fields.push(
-        field(
-          "radius",
-          "半径",
-          Number(formatted(e.kind === "arc" ? arcInfo(e).r : (e.radius ?? 1))),
-        ),
+        field("diameter", "直径", Number(formatted(2 * (e.radius ?? 1)))),
       );
+    else if (e.kind === "arc")
+      fields.push(field("radius", "半径", Number(formatted(arcInfo(e).r))));
     if (e.kind === "ellipse")
       fields.push(field("ry", "短轴半径", Number(formatted(e.ry ?? 1))));
     if (e.kind === "conic")
@@ -1846,6 +1993,7 @@ export default function App() {
           item.name = values.name.trim() || kindLabels[item.kind];
           for (const key of [
             "radius",
+            "diameter",
             "ry",
             "weight",
             "fontSize",
@@ -1870,7 +2018,7 @@ export default function App() {
             )
               throw new Error("短轴已绑定，请编辑绑定点或移除短轴关联");
             if (
-              key === "radius" &&
+              (key === "radius" || key === "diameter") &&
               s.constraints.some(
                 (c) =>
                   ["radius", "diameter"].includes(c.kind) &&
@@ -1897,7 +2045,8 @@ export default function App() {
                   add(item.points[0], mul(sub(p, item.points[0]), ratio)),
                 );
             }
-            item[key] = n;
+            if (key === "diameter") item.radius = n / 2;
+            else item[key] = n;
           }
           if (item.kind === "text") {
             if (!values.text.trim()) throw new Error("文本不能为空");
@@ -1997,6 +2146,7 @@ export default function App() {
           <FileJson size={16} />
           <input
             aria-label="文档名称"
+            title={workspace.activeFile?.name ?? doc.name}
             value={doc.name}
             onChange={(e) =>
               setDoc({ ...docRef.current, name: e.target.value })
@@ -2005,7 +2155,19 @@ export default function App() {
           <span className="save-dot" data-saved={saved} />
         </div>
         <div className="header-right">
-          <span className="save-label">{saved ? "本地已保存" : "未保存"}</span>
+          <span className="save-label" title={workspace.activeFile?.name}>
+            {workspace.activeFile
+              ? `${workspace.activeFile.name} · ${saved ? "项目已保存" : "未保存"}`
+              : saved
+                ? "本地已保存"
+                : "未保存"}
+          </span>
+          <IconButton
+            icon={FolderOpen}
+            title="文件管理器"
+            disabled={!workspace.ready}
+            onClick={() => openFileManager("browse")}
+          />
           <a
             className="license-link"
             href="/THIRD_PARTY_NOTICES.txt"
@@ -2039,6 +2201,13 @@ export default function App() {
           {menu === "file" && (
             <div className="menu file-menu">
               <MenuItem
+                icon={FolderOpen}
+                label="文件管理器"
+                shortcut="Ctrl O"
+                onClick={() => openFileManager("browse")}
+              />
+              <div className="menu-divider" />
+              <MenuItem
                 icon={FilePlus2}
                 label="新建文档"
                 onClick={() => newDocument()}
@@ -2055,6 +2224,22 @@ export default function App() {
                 icon={Save}
                 label="保存草图"
                 shortcut="Ctrl S"
+                onClick={() => void saveProject()}
+              />
+              <MenuItem
+                icon={Save}
+                label="项目另存为"
+                shortcut="Ctrl Shift S"
+                onClick={() => openFileManager("save")}
+              />
+              <MenuItem
+                icon={Download}
+                label="下载项目"
+                onClick={downloadProject}
+              />
+              <MenuItem
+                icon={FileJson}
+                label="导出 JSON 草图"
                 onClick={saveJson}
               />
               <div className="menu-divider" />
@@ -2065,7 +2250,7 @@ export default function App() {
               />
               <MenuItem
                 icon={Download}
-                label="导出 DXF / SVG"
+                label="导出 DXF / SVG / PDF"
                 onClick={openExport}
               />
             </div>
@@ -2645,12 +2830,12 @@ export default function App() {
                     )}
                     {(one.kind === "circle" || one.kind === "arc") && (
                       <div className="property-row">
-                        <span>半径</span>
+                        <span>{one.kind === "circle" ? "直径" : "半径"}</span>
                         <strong>
                           {formatted(
                             one.kind === "arc"
                               ? arcInfo(one).r
-                              : (one.radius ?? 0),
+                              : 2 * (one.radius ?? 0),
                           )}
                           <small>{unit}</small>
                         </strong>
@@ -2965,6 +3150,20 @@ export default function App() {
         </div>
       </footer>
       {menu && <div className="menu-dismiss" onClick={() => setMenu(null)} />}
+      {fileManager && (
+        <FileManager
+          mode={fileManager}
+          document={doc}
+          project={workspace.project}
+          activeFileId={workspace.activeFile?.id}
+          initialFolderId={workspace.activeFile?.parentId ?? ROOT_ID}
+          onOpen={openVirtualProject}
+          onSaved={saveVirtualProject}
+          onProjectChanged={workspace.updateProject}
+          onEntriesChanged={refreshVirtualFiles}
+          onClose={() => setFileManager(null)}
+        />
+      )}
       {modal && (
         <ModalView
           key={modal.title + modal.fields.map((f) => f.value).join("|")}
@@ -2975,18 +3174,29 @@ export default function App() {
       <input
         ref={fileInput}
         type="file"
-        accept=".json,.sketch.json"
+        accept=".swcad,.asar,.json,.sketch.json"
         hidden
         onChange={async (e) => {
           const file = e.target.files?.[0];
           if (!file) return;
           try {
-            if (file.size > 10_000_000) throw new Error("文件超过 10 MB");
-            const next = validateDocument(JSON.parse(await file.text()));
-            if (commit(next, "打开草图")) {
-              switchSketch(next.sketches[0].id);
+            const isAsar = /\.(?:swcad|asar)$/i.test(file.name);
+            if (file.size > (isAsar ? 100 * 1024 * 1024 : 10_000_000))
+              throw new Error(
+                isAsar ? "项目文件超过 100 MB" : "文件超过 10 MB",
+              );
+            const project = isAsar
+              ? decodeProject(await file.arrayBuffer())
+              : createProject(validateDocument(JSON.parse(await file.text())));
+            await workspace.persist();
+            if (commit(clone(project.document), "打开草图", false)) {
+              history.current = [];
+              future.current = [];
+              setHistoryVersion((value) => value + 1);
+              workspace.detach(docRef.current, project);
+              switchSketch(docRef.current.sketches[0].id);
               setFitKey((v) => v + 1);
-              notify("草图已打开");
+              notify(isAsar ? "项目已打开" : "JSON 草图已打开");
             }
           } catch (error) {
             notify((error as Error).message, true);
