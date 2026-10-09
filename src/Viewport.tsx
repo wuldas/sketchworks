@@ -14,18 +14,21 @@ import {
   type Sketch,
   type Selection,
   type XY,
+  type AngleSector,
 } from "./model";
 import {
   resolveDimensionPreview,
   type DimensionPickMode,
 } from "./dimensionPick";
 import { bounds, dist } from "./geometry";
+import { dimensionLabelAnchor, dimensionReferences } from "./dimensionLabel";
 import { resolveBodyDragEntities } from "./dragTransaction";
 import { appendSplinePoint } from "./splineDraft";
 import {
   defaultSnapOptions,
   isSnapEnabled,
   type SnapOptions,
+  type SnapReference,
 } from "./snapping";
 import { DimensionInput, type DimensionInputHandle } from "./DimensionInput";
 import {
@@ -43,6 +46,7 @@ import {
 } from "./canvasRenderer";
 import {
   dragAnchor,
+  resolveDragSelection,
   resolveDragSnap,
   sameDragPosition,
   type DragEvent,
@@ -61,15 +65,15 @@ export interface ViewportProps {
   snapOptions?: SnapOptions;
   fitKey: number;
   unit: "mm" | "in";
-  onPlace: (point: XY, snapRef?: string, captured?: boolean) => void;
+  onPlace: (point: XY, snapRef?: SnapReference, captured?: boolean) => void;
   onSelect: (selection: Selection | null, additive: boolean) => void;
   onBox: (ids: string[], additive: boolean) => void;
   onCursor: (point: XY) => void;
   onDrag: (event: DragEvent) => DragFeedback | void;
-  onFinish: (point?: XY, snapRef?: string) => void;
+  onFinish: (point?: XY, snapRef?: SnapReference) => void;
   onEditConstraint: (id: string) => void;
-  pickOperation?: string;
-  onPickOperation?: (entityId: string, point: XY) => void;
+  pickParameters?: "geometry" | "position";
+  onParameterPick?: (selection: Selection | null, point: XY) => void;
   /** Dimension tool active: canvas clicks pick geometry instead of selecting it. */
   pickDimension?: boolean;
   /** References picked so far, drawn as a rubber band towards the cursor. */
@@ -77,6 +81,8 @@ export interface ViewportProps {
   dimensionPicks?: string[];
   dimensionKindMode?: DimensionPickMode;
   dimensionAdjustment?: Constraint | null;
+  dimensionSelection?: string | null;
+  onDimensionSelect?: (id: string | null) => void;
   onDimensionAdjust?: (id: string) => void;
   onDimensionPositionCommit?: (id: string, point: XY) => void;
   dimensionDraft?: {
@@ -84,6 +90,7 @@ export interface ViewportProps {
     refs: string[];
     anchor?: XY;
     labelPosition?: XY;
+    angleSector?: AngleSector;
     constraintId?: string;
     value: string;
     unit: string;
@@ -200,12 +207,14 @@ export function Viewport(props: ViewportProps) {
       cursor: null,
       snapPoint: null,
       marquee: null,
+      dimensionSelection: current.dimensionSelection ?? null,
       dimensionPreview: current.dimensionAdjustment
         ? {
             kind: current.dimensionAdjustment.kind,
             refs: current.dimensionAdjustment.refs,
             value: current.dimensionAdjustment.value,
             labelPosition: current.dimensionAdjustment.labelPosition,
+            angleSector: current.dimensionAdjustment.angleSector,
             constraintId: current.dimensionAdjustment.id,
             fixed: false,
           }
@@ -215,6 +224,7 @@ export function Viewport(props: ViewportProps) {
               kind: current.dimensionDraft.kind,
               refs: current.dimensionDraft.refs,
               labelPosition: current.dimensionDraft.labelPosition,
+              angleSector: current.dimensionDraft.angleSector,
               fixed: true,
             }
           : null,
@@ -299,6 +309,13 @@ export function Viewport(props: ViewportProps) {
       }
       if (current.dimensionAdjustment && activeGesture?.mode === "dimension") {
         currentFrame.dimensionPreview!.labelPosition = activeGesture.target;
+        if (
+          currentFrame.dimensionPreview!.kind === "angle" &&
+          currentFrame.dimensionPreview!.refs.length === 2
+        ) {
+          currentFrame.dimensionPreview!.angleSector = undefined;
+          currentFrame.dimensionPreview!.value = undefined;
+        }
       } else if (
         current.pickDimension &&
         !current.dimensionDraft &&
@@ -342,11 +359,23 @@ export function Viewport(props: ViewportProps) {
     [requestDraw],
   );
   const fit = useCallback(() => {
-    const visible = propsRef.current.sketches
-      .filter((sketch) => sketch.visible)
-      .flatMap((sketch) => sketch.entities);
+    const sketches = propsRef.current.sketches.filter(
+        (sketch) => sketch.visible,
+      ),
+      visible = sketches.flatMap((sketch) => sketch.entities);
     const extent = bounds(visible),
       currentSize = sizeRef.current;
+    for (const sketch of sketches) {
+      const refs = dimensionReferences(sketch);
+      for (const constraint of sketch.constraints) {
+        const label = dimensionLabelAnchor(constraint, refs);
+        if (!label || ![label.x, label.y].every(Number.isFinite)) continue;
+        extent.minX = Math.min(extent.minX, label.x);
+        extent.maxX = Math.max(extent.maxX, label.x);
+        extent.minY = Math.min(extent.minY, label.y);
+        extent.maxY = Math.max(extent.maxY, label.y);
+      }
+    }
     updateView({
       center: {
         x: (extent.minX + extent.maxX) / 2,
@@ -501,6 +530,7 @@ export function Viewport(props: ViewportProps) {
     props.dimensionKindMode,
     props.dimensionDraft,
     props.dimensionAdjustment,
+    props.dimensionSelection,
     size,
     dpr,
     view,
@@ -607,9 +637,13 @@ export function Viewport(props: ViewportProps) {
       world = toWorld(point),
       currentFrame = frame();
     pointer.current = point;
+    // Right click cancels any dimension step (pick phase included), matching
+    // Escape; middle button remains available for panning.
     if (
-      (current.dimensionDraft || current.dimensionAdjustment) &&
-      event.button === 2
+      event.button === 2 &&
+      (current.dimensionDraft ||
+        current.dimensionAdjustment ||
+        current.pickDimension)
     ) {
       event.preventDefault();
       current.onDimensionCancel?.();
@@ -626,41 +660,57 @@ export function Viewport(props: ViewportProps) {
       return;
     }
     const pan = event.button !== 0 || space.current;
-    const selected = pan
-      ? null
-      : renderer.current!.hitTest(point, currentFrame);
+    const hit = pan ? null : renderer.current!.hitTest(point, currentFrame);
+    const selectMode =
+      !pan &&
+      current.tool === "select" &&
+      !current.pickDimension &&
+      !current.pickParameters;
     const dimension =
-      !pan && !selected?.pointId
+      !pan && !hit?.pointId && !current.pickParameters
         ? (renderer.current!.dimensionAt(point, currentFrame) ??
-          (current.pickDimension && !selected
+          ((current.pickDimension || selectMode) && !hit
             ? renderer.current!.dimensionAt(point, currentFrame, true)
             : null))
         : null;
-    if (dimension && !current.pickDimension) {
+    if (dimension && !current.pickDimension && !selectMode) {
       event.preventDefault();
       return;
     }
+    if (selectMode && dimension) current.onDimensionSelect?.(dimension);
     const dimensionAnchor = dimension
       ? renderer.current!.dimensionAnchor(dimension)
       : null;
     const dimensionWorld = dimensionAnchor ? toWorld(dimensionAnchor) : world;
     const additive = event.ctrlKey || event.metaKey || event.shiftKey;
+    const selected =
+      hit &&
+      current.tool === "select" &&
+      !current.pickDimension &&
+      !current.pickParameters &&
+      !additive
+        ? resolveDragSelection(hit, current.selection)
+        : hit;
     const dimensionPick = !pan && !!current.pickDimension;
+    const parameterPick = !pan && !!current.pickParameters;
     let mode: Gesture["mode"] = pan
       ? "pan"
-      : dimension
-        ? "dimension"
-        : dimensionPick || (current.tool !== "select" && !current.pickOperation)
+      : parameterPick
+        ? current.pickParameters === "position" || selected
           ? "place"
-          : selected
-            ? "drag"
-            : "box";
-    if (dimensionPick) {
-      // The dimension tool only picks references; it never selects or drags.
-    } else if (!pan && current.pickOperation && selected) {
-      current.onPickOperation?.(selected.entityId, world);
-      mode = "place";
-    } else if (!pan && current.tool === "select" && selected) {
+          : "box"
+        : dimension
+          ? "dimension"
+          : dimensionPick || current.tool !== "select"
+            ? "place"
+            : selected
+              ? "drag"
+              : "box";
+    if (mode === "drag" || mode === "box" || parameterPick)
+      canvas.current?.focus({ preventScroll: true });
+    if (dimensionPick || parameterPick) {
+      // Command and dimension tools only collect references on release.
+    } else if (!pan && current.tool === "select" && selected && !dimension) {
       const already = current.selection.some(
         (item) =>
           item.entityId === selected.entityId &&
@@ -833,7 +883,7 @@ export function Viewport(props: ViewportProps) {
           ? "grabbing"
           : dimension && current.pickDimension && !current.dimensionDraft
             ? "move"
-            : current.pickOperation ||
+            : current.pickParameters ||
                 current.pickDimension ||
                 current.tool !== "select"
               ? "crosshair"
@@ -902,20 +952,33 @@ export function Viewport(props: ViewportProps) {
           ? renderer.current!.snap(world, currentFrame)
           : null;
       current.onFinish(
-        captured?.kind === "endpoint" ? captured.point : undefined,
-        captured?.kind === "endpoint" ? captured.ref : undefined,
+        captured && captured.kind !== "grid" ? captured.point : undefined,
+        captured?.ref ?? captured?.binding,
       );
     } else if (activeGesture.mode === "place" && !activeGesture.moved) {
-      if (current.pickDimension) {
+      if (current.pickParameters) {
+        const snap =
+          current.pickParameters === "position" && current.snap
+            ? renderer.current!.snap(world, currentFrame)
+            : null;
+        current.onParameterPick?.(
+          renderer.current!.hitTest(point, currentFrame),
+          snap?.point ?? world,
+        );
+      } else if (current.pickDimension) {
         current.onDimensionPick?.(
           renderer.current!.hitTest(point, currentFrame),
           world,
         );
-      } else if (!current.pickOperation) {
+      } else if (!current.pickParameters) {
         const candidate = current.snap
           ? renderer.current!.snap(world, currentFrame)
           : null;
-        current.onPlace(candidate?.point ?? world, candidate?.ref, !!candidate);
+        current.onPlace(
+          candidate?.point ?? world,
+          candidate?.ref ?? candidate?.binding,
+          !!candidate,
+        );
       }
     } else if (activeGesture.mode === "box") {
       if (!activeGesture.moved) current.onSelect(null, activeGesture.additive);
@@ -945,7 +1008,7 @@ export function Viewport(props: ViewportProps) {
         style={{
           cursor: panning
             ? "grabbing"
-            : props.pickOperation ||
+            : props.pickParameters ||
                 props.pickDimension ||
                 props.tool !== "select"
               ? "crosshair"
@@ -970,6 +1033,7 @@ export function Viewport(props: ViewportProps) {
           if (gesture.current?.mode === "dimension") cancelGesture();
         }}
         onDoubleClick={(event) => {
+          if (propsRef.current.pickParameters) return;
           const current = propsRef.current,
             point = local(event),
             dimension = renderer.current!.dimensionAt(point, frame());
@@ -992,7 +1056,11 @@ export function Viewport(props: ViewportProps) {
             : undefined;
           const anchor = existing
             ? renderer.current!.dimensionPreviewAnchor(
-                { ...existing, fixed: true },
+                {
+                  ...existing,
+                  angleSector: draft.angleSector ?? existing.angleSector,
+                  fixed: true,
+                },
                 frame(),
               )
             : draft.labelPosition
@@ -1001,6 +1069,7 @@ export function Viewport(props: ViewportProps) {
                     kind: draft.kind,
                     refs: draft.refs,
                     labelPosition: draft.labelPosition,
+                    angleSector: draft.angleSector,
                     fixed: true,
                   },
                   frame(),

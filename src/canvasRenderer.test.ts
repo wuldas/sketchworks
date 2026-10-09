@@ -74,6 +74,55 @@ function fakeCanvas(): HTMLCanvasElement {
 }
 afterEach(() => vi.unstubAllGlobals());
 describe("retained Canvas renderer", () => {
+  it("renders relative labels against current geometry even when the world cache has not been refreshed", () => {
+    vi.stubGlobal("Path2D", FakePath);
+    const e = entity("line", [
+        { x: 0, y: 0 },
+        { x: 20, y: 0 },
+      ]),
+      s = sketch([e], {
+        constraints: [
+          {
+            id: "relative",
+            kind: "length",
+            refs: [e.id],
+            value: 20,
+            labelPosition: { x: 10, y: 8 },
+            labelOffset: { x: 0, y: 8 },
+          },
+        ],
+      }),
+      r = new CanvasRenderer(),
+      canvas = fakeCanvas(),
+      f = frame();
+    r.sync([s], s.id);
+    r.draw(canvas, f);
+    expect(r.dimensionAnchor("relative")).toEqual({ x: 440, y: 268 });
+    const moved = clone(s);
+    for (const p of moved.entities[0].points) {
+      p.x += 7;
+      p.y += 9;
+    }
+    r.sync([moved], moved.id);
+    r.draw(canvas, f);
+    expect(r.dimensionAnchor("relative")).toEqual({ x: 468, y: 232 });
+    expect(moved.constraints[0].labelPosition).toEqual({ x: 10, y: 8 });
+    const preview = frame({
+      dimensionPreview: {
+        kind: "length",
+        refs: [e.id],
+        value: 20,
+        labelPosition: { x: 12, y: 30 },
+        fixed: true,
+      },
+    });
+    r.draw(canvas, preview);
+    expect(r.metadata(preview).dimensionPreview).toMatchObject({
+      x: 468,
+      y: 180,
+    });
+  });
+
   it("round-trips world and screen coordinates after pan and zoom", () => {
     for (const scale of [0.01, 1, 4, 250]) {
       const f = frame({ view: { center: { x: 37, y: -23 }, scale } }),
@@ -738,11 +787,43 @@ describe("retained Canvas renderer", () => {
     });
     r.draw(canvas, f);
     const label = r.metadata(f).dimensionPreview!;
-    expect(label.text).toBe("-45\u00b0");
+    expect(label.text).toBe("45\u00b0");
+    expect(label.x).toBeGreaterThan(f.width / 2);
+    expect(label.y).toBeGreaterThan(f.height / 2);
     const origin = worldToScreen({ x: 0, y: 0 }, f);
     expect(Math.hypot(label.x - origin.x, label.y - origin.y)).toBeCloseTo(
       Math.hypot(15, 10) * f.view.scale,
     );
+  });
+  it("marks only the selected annotation in its painted metadata", () => {
+    vi.stubGlobal("Path2D", FakePath);
+    const e = entity("line", [
+        { x: 0, y: 0 },
+        { x: 20, y: 0 },
+      ]),
+      s = sketch([e], {
+        constraints: [
+          {
+            id: "length",
+            kind: "length",
+            refs: [e.id],
+            value: 20,
+            labelPosition: { x: 10, y: 8 },
+          },
+        ],
+      }),
+      r = new CanvasRenderer(),
+      canvas = fakeCanvas();
+    r.sync([s], s.id);
+    const idle = frame();
+    r.draw(canvas, idle);
+    expect(r.metadata(idle).dimensions[0].selected).toBe(false);
+    const active = frame({ dimensionSelection: "length" });
+    r.draw(canvas, active);
+    expect(r.metadata(active).dimensions[0].selected).toBe(true);
+    const cleared = frame();
+    r.draw(canvas, cleared);
+    expect(r.metadata(cleared).dimensions[0].selected).toBe(false);
   });
   it("rebuilds closed profiles on construction toggles without recompiling native geometry", () => {
     vi.stubGlobal("Path2D", FakePath);

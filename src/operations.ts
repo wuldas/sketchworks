@@ -29,6 +29,10 @@ import {
   updateDerived,
   validGeometry,
 } from "./geometry";
+import {
+  prepareDimensionLabels,
+  updateDimensionLabels,
+} from "./dimensionLabel";
 
 const TOL = 0.001;
 const TAU = Math.PI * 2;
@@ -91,6 +95,7 @@ function notFixed(sketch: Sketch, entities: Entity[]) {
   const affected = sketch.entities.filter(
     (e) =>
       ids.has(e.id) ||
+      (e.ownerId && ids.has(e.ownerId)) ||
       (e.sourceId && ids.has(e.sourceId)) ||
       (e.transform?.axisId && ids.has(e.transform.axisId)) ||
       (e.transform?.secondarySourceId &&
@@ -101,7 +106,9 @@ function notFixed(sketch: Sketch, entities: Entity[]) {
   );
   if (
     sketch.constraints.some(
-      (c) => c.kind === "fixed" && c.refs.some((r) => refs.has(r)),
+      (c) =>
+        (c.kind === "fixed" || c.kind === "origin") &&
+        c.refs.some((r) => refs.has(r)),
     )
   )
     fail("固定对象不能修改，请先解除固定约束");
@@ -132,7 +139,17 @@ function replace(
   before.filter((id) => !remaining.has(id)).forEach((id) => removed.add(id));
   sketch.entities.push(...replacements);
 }
+function withOwned(sketch: Sketch, sources: Entity[]) {
+  const ids = new Set(sources.map((e) => e.id));
+  return [
+    ...sources,
+    ...sketch.entities.filter(
+      (e) => e.ownerId && ids.has(e.ownerId) && !ids.has(e.id),
+    ),
+  ];
+}
 function cloneBatch(sketch: Sketch, sources: Entity[], transform: Transform) {
+  sources = withOwned(sketch, sources);
   capacity(sketch, sources.length);
   const mapping = new Map<string, string>();
   const copies = sources.map((source) => {
@@ -145,10 +162,17 @@ function cloneBatch(sketch: Sketch, sources: Entity[], transform: Transform) {
     source.points.forEach((p, i) => mapping.set(p.id, copy.points[i].id));
     return copy;
   });
+  for (let i = 0; i < copies.length; i++) {
+    const ownerId = sources[i].ownerId;
+    if (ownerId && mapping.has(ownerId))
+      copies[i].ownerId = mapping.get(ownerId);
+    else delete copies[i].ownerId;
+  }
   const constraints = sketch.constraints
     .filter(
       (c) =>
         c.kind !== "fixed" &&
+        c.kind !== "origin" &&
         !c.anchors?.length &&
         c.refs.every((r) => mapping.has(r)),
     )
@@ -175,6 +199,7 @@ function derivedBatch(sketch: Sketch, sources: Entity[], transform: Transform) {
     const copy = transformedEntity(source, transform, true);
     copy.id = uid();
     copy.name = `${source.name} 关联副本`;
+    delete copy.ownerId;
     copy.sourceId = source.id;
     copy.transform = clone(transform);
     sketch.entities.push(copy);
@@ -699,6 +724,7 @@ export function modifySketch(
   if (!entities.length) fail("请先选择对象");
   if (pick && ![pick.x, pick.y].every(Number.isFinite)) fail("拾取坐标无效");
   validGeometry(candidate);
+  prepareDimensionLabels(candidate);
   const center = () => ({
     x: number(values, "cx", 0),
     y: number(values, "cy", 0),
@@ -707,13 +733,14 @@ export function modifySketch(
     case "move":
     case "rotate":
     case "scale": {
-      if (entities.some((e) => e.sourceId))
+      const moving = withOwned(candidate, entities);
+      if (moving.some((e) => e.sourceId))
         fail("派生对象不能直接变换，请先解除派生关系");
-      notFixed(candidate, entities);
+      notFixed(candidate, moving);
       if (operation === "scale") {
         const factor = positive(values, "factor"),
           c = center();
-        for (const e of entities) {
+        for (const e of moving) {
           e.points.forEach((p) =>
             Object.assign(p, add(c, mul(sub(p, c), factor))),
           );
@@ -735,7 +762,7 @@ export function modifySketch(
                 y: c.y,
                 angle: number(values, "angle"),
               };
-        entities.forEach((e) =>
+        moving.forEach((e) =>
           Object.assign(e, transformedEntity(e, transform)),
         );
       }
@@ -812,6 +839,7 @@ export function modifySketch(
       const axis = entities[entities.length - 1],
         sources = entities.slice(0, -1);
       if (axis.kind !== "line") fail("最后选中的对象必须是镜像轴直线");
+      if (axis.sourceId) fail("镜像轴须先解除关联");
       if (sources.some((e) => e.sourceId))
         fail("不能再次派生镜像对象，请先解除派生关系");
       capacity(candidate, sources.length);
@@ -832,18 +860,36 @@ export function modifySketch(
         fail("不能再次派生关联对象，请先解除派生关系");
       const cols = integer(values, "cols", 2),
         rows = integer(values, "rows", 1);
+      if (
+        (values.direction1 === 0 && cols % 2 === 0) ||
+        (values.direction2 === 0 && rows % 2 === 0)
+      )
+        fail("对称阵列的数量须为奇数（包含原对象）");
       const dx = number(values, "dx", 0),
         dy = number(values, "dy", 0);
       if ((cols > 1 && Math.abs(dx) < EPS) || (rows > 1 && Math.abs(dy) < EPS))
         fail("阵列间距不能为零");
+      const direction = {
+        x: number(values, "ux", 1),
+        y: number(values, "uy", 0),
+      };
+      if (Math.hypot(direction.x, direction.y) < EPS) fail("阵列方向无效");
+      const u = normalize(direction),
+        v = { x: -u.y, y: u.x };
+      const spacingX = values.range ? dx / Math.max(1, cols - 1) : dx;
+      const spacingY = values.range ? dy / Math.max(1, rows - 1) : dy;
+      const index = (i: number, count: number, mode = 1) =>
+        mode === 0 ? i - Math.floor(count / 2) : mode === -1 ? -i : i;
       capacity(candidate, entities.length * (cols * rows - 1));
       for (let row = 0; row < rows; row++)
         for (let col = 0; col < cols; col++) {
-          if (row || col)
+          const x = index(col, cols, values.direction1) * spacingX;
+          const y = index(row, rows, values.direction2) * spacingY;
+          if (x || y)
             derivedBatch(candidate, entities, {
               kind: "translate",
-              x: col * dx,
-              y: row * dy,
+              x: u.x * x + v.x * y,
+              y: u.y * x + v.y * y,
             });
         }
       break;
@@ -905,6 +951,7 @@ export function modifySketch(
   );
   if (candidate.constraints.some((c) => c.refs.some((r) => !live.has(r))))
     fail("操作产生了无效约束引用");
+  updateDimensionLabels(candidate);
   sketch.entities = candidate.entities;
   sketch.constraints = candidate.constraints;
   return { removedConstraints: [...removed] };

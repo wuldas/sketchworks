@@ -17,6 +17,7 @@ import {
   arcInfo,
   EPS,
 } from "./geometry";
+import { type SnapReference } from "./snapping";
 export type Tool =
   | "select"
   | "line"
@@ -300,26 +301,255 @@ export function createGeometry(
   }
   return { entities, constraints };
 }
+export interface CreationCapture {
+  pointIndex: number;
+  ref: SnapReference;
+  point?: XY;
+}
+
 export function appendGeometry(
   sketch: Sketch,
   result: ReturnType<typeof createGeometry>,
-  snaps: { pointIndex: number; ref: string }[],
+  snaps: CreationCapture[],
   auto: boolean,
+  tool?: Tool,
 ) {
   sketch.entities.push(...result.entities);
   sketch.constraints.push(...result.constraints);
   if (!auto) return;
-  for (const snap of snaps) {
-    const p = result.entities[0]?.points[snap.pointIndex];
+  const constrain = (kind: Constraint["kind"], refs: string[]) => {
     if (
-      p &&
-      p.id !== snap.ref &&
-      sketch.entities.some((e) => e.points.some((q) => q.id === snap.ref))
+      !sketch.constraints.some(
+        (c) =>
+          c.kind === kind &&
+          c.refs.length === refs.length &&
+          refs.every((ref) => c.refs.includes(ref)),
+      )
     )
-      sketch.constraints.push({
-        id: uid("c"),
-        kind: "coincident",
-        refs: [p.id, snap.ref],
-      });
+      sketch.constraints.push({ id: uid("c"), kind, refs });
+  };
+  const helper = (coords: XY, owner: Entity) => {
+    const e = entity("point", [coords], {
+      construction: true,
+      ownerId: owner.id,
+    });
+    sketch.entities.push(e);
+    return e.points[0];
+  };
+  const perimeter = (coords: XY, owner: Entity) => {
+    const p = helper(coords, owner);
+    constrain("onCurve", [p.id, owner.id]);
+    return p;
+  };
+  const radialCapture = (
+    coords: XY,
+    owner: Entity,
+    end: XY & { id: string },
+  ) => {
+    const ray = entity("line", [owner.points[0], end], {
+      construction: true,
+      ownerId: owner.id,
+    });
+    sketch.entities.push(ray);
+    constrain("coincident", [ray.points[0].id, owner.points[0].id]);
+    constrain("coincident", [ray.points[1].id, end.id]);
+    const p = helper(coords, owner);
+    sketch.constraints.push({
+      id: uid("c"),
+      kind: "onLine",
+      refs: [p.id, ray.id],
+      sameRay: true,
+    });
+    return p;
+  };
+  let polygonCircle: Entity | undefined;
+  const polygonControl = () => {
+    if (polygonCircle) return polygonCircle;
+    const es = result.entities,
+      info = circleFromThree(es[0].points[0], es[1].points[0], es[2].points[0]);
+    if (!info) return;
+    polygonCircle = entity("circle", [info.center], {
+      radius: info.radius,
+      construction: true,
+      ownerId: es[0].id,
+    });
+    sketch.entities.push(polygonCircle);
+    for (const side of es)
+      constrain("onCurve", [side.points[0].id, polygonCircle.id]);
+    return polygonCircle;
+  };
+  // Input clicks are not generally in the same order as an entity's control points.
+  const destination = (snap: CreationCapture) => {
+    const es = result.entities,
+      e = es[0],
+      i = snap.pointIndex,
+      coords = snap.point;
+    if (!e) return;
+    switch (tool) {
+      case "line":
+      case "spline":
+      case "bezier":
+      case "conic":
+      case "point":
+      case "text":
+        return e.points[i];
+      case "midline":
+        return i === 0 ? es[1].points[0] : e.points[1];
+      case "rectangle":
+        return i === 0 ? e.points[0] : es[1].points[1];
+      case "centerRectangle": {
+        if (i === 1) return es[1].points[1];
+        if (!coords) return;
+        const p = helper(coords, e);
+        constrain("symmetric", [e.points[0].id, es[1].points[1].id, p.id]);
+        return p;
+      }
+      case "circle":
+        return i === 0
+          ? e.points[0]
+          : coords
+            ? perimeter(coords, e)
+            : undefined;
+      case "threeCircle":
+        return coords ? perimeter(coords, e) : undefined;
+      case "arc":
+        return i === 0
+          ? e.points[1]
+          : i === 2
+            ? e.points[2]
+            : coords
+              ? perimeter(coords, e)
+              : undefined;
+      case "centerArc":
+        return i < 2
+          ? e.points[i]
+          : coords
+            ? radialCapture(coords, e, e.points[2])
+            : undefined;
+      case "polygon": {
+        if (!coords) return;
+        if (i === 0) return polygonControl()?.points[0];
+        const vertex = es
+          .flatMap((part) => part.points)
+          .find((p) => dist(p, coords) <= EPS);
+        if (vertex) return vertex;
+        const outer = polygonControl();
+        if (!outer) return;
+        const inner = entity("circle", [outer.points[0]], {
+            radius: dist(coords, outer.points[0]),
+            construction: true,
+            ownerId: e.id,
+          }),
+          ray = entity("line", [outer.points[0], e.points[0]], {
+            construction: true,
+            ownerId: e.id,
+          });
+        sketch.entities.push(inner, ray);
+        constrain("concentric", [inner.id, outer.id]);
+        constrain("tangent", [es[0].id, inner.id]);
+        constrain("coincident", [ray.points[0].id, outer.points[0].id]);
+        constrain("coincident", [ray.points[1].id, e.points[0].id]);
+        const p = helper(coords, e);
+        constrain("onCurve", [p.id, inner.id]);
+        constrain("onLine", [p.id, ray.id]);
+        return p;
+      }
+      case "ellipse": {
+        if (i < 2) return e.points[i];
+        if (!coords) return;
+        const axis = entity("line", [e.points[0], e.points[1]], {
+            construction: true,
+            ownerId: e.id,
+          }),
+          width = entity(
+            "line",
+            [coords, add(coords, sub(e.points[1], e.points[0]))],
+            { construction: true, ownerId: e.id },
+          ),
+          circle = entity("circle", [e.points[0]], {
+            radius: e.ry,
+            construction: true,
+            ownerId: e.id,
+          });
+        sketch.entities.push(axis, width, circle);
+        constrain("coincident", [axis.points[0].id, e.points[0].id]);
+        constrain("coincident", [axis.points[1].id, e.points[1].id]);
+        constrain("coincident", [circle.points[0].id, e.points[0].id]);
+        constrain("parallel", [axis.id, width.id]);
+        constrain("tangent", [width.id, circle.id]);
+        constrain("ellipseWidth", [e.id, circle.id]);
+        return width.points[0];
+      }
+      case "slot":
+        if (i < 2) return es[i === 0 ? 3 : 1].points[0];
+        if (coords) {
+          const side =
+              cross(
+                sub(es[1].points[0], es[3].points[0]),
+                sub(coords, es[1].points[0]),
+              ) >= 0
+                ? es[0]
+                : es[2],
+            p = helper(coords, side);
+          constrain("onLine", [p.id, side.id]);
+          return p;
+        }
+        return;
+      case "arcSlot":
+        if (i === 0) return e.points[0];
+        if (i === 1) return es[2].points[0];
+        if (i === 2 && coords) return radialCapture(coords, e, es[3].points[0]);
+        if (!coords) return;
+        const boundary =
+            Math.abs(dist(coords, e.points[0]) - (e.radius ?? 0)) <= EPS
+              ? e
+              : es[1],
+          circle = entity("circle", [boundary.points[0]], {
+            radius: boundary.radius,
+            construction: true,
+            ownerId: e.id,
+          });
+        sketch.entities.push(circle);
+        constrain("concentric", [circle.id, boundary.id]);
+        constrain("equal", [circle.id, boundary.id]);
+        const p = helper(coords, e);
+        constrain("onCurve", [p.id, circle.id]);
+        return p;
+      default:
+        return coords
+          ? es
+              .flatMap((part) => part.points)
+              .find((p) => dist(p, coords) <= EPS)
+          : e.points[i];
+    }
+  };
+  for (const snap of snaps) {
+    const ref = snap.ref;
+    const refs = typeof ref === "string" ? [ref] : ref.refs;
+    if (
+      refs.some(
+        (id) =>
+          !sketch.entities.some(
+            (e) =>
+              !e.sourceId &&
+              (typeof ref === "string"
+                ? e.points.some((p) => p.id === id)
+                : e.id === id),
+          ),
+      )
+    )
+      continue;
+    const p = destination(snap);
+    if (!p) continue;
+    if (typeof ref === "string") {
+      if (p.id !== ref) constrain("coincident", [p.id, ref]);
+    } else if (ref.kind === "tangent") {
+      constrain("onCurve", [p.id, ...ref.refs]);
+      const line = result.entities[0];
+      if (line.kind === "line" && (tool === "line" || tool === "midline"))
+        constrain("tangent", [line.id, ...ref.refs]);
+    } else {
+      constrain(ref.kind, [p.id, ...ref.refs]);
+    }
   }
 }

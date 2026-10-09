@@ -9,6 +9,7 @@ import {
 } from "./model";
 import {
   angleDimensionFrame,
+  selectAngleSector,
   arcInfo,
   bounds as geometryBounds,
   dist,
@@ -28,17 +29,20 @@ import {
   snapRadius,
   type SnapKind,
   type SnapOptions,
+  type SnapBinding,
 } from "./snapping";
+import { dimensionLabelPosition } from "./dimensionLabel";
 
 export type CanvasView = { center: XY; scale: number };
 export type CanvasSnap = {
   point: XY;
   ref?: string;
+  binding?: SnapBinding;
   kind: SnapKind;
 };
 export type CanvasDimensionPreview = Pick<
   Constraint,
-  "kind" | "refs" | "value" | "labelPosition"
+  "kind" | "refs" | "value" | "labelPosition" | "angleSector"
 > & { fixed: boolean; constraintId?: string };
 export interface CanvasFrame {
   width: number;
@@ -55,6 +59,7 @@ export interface CanvasFrame {
   cursor: XY | null;
   snapPoint: CanvasSnap | null;
   marquee: { a: XY; b: XY } | null;
+  dimensionSelection?: string | null;
   dimensionPreview?: CanvasDimensionPreview | null;
 }
 export interface CanvasHandle extends Selection {
@@ -93,6 +98,7 @@ export interface CanvasMetadata {
     x: number;
     y: number;
     bounds: CanvasBounds;
+    selected: boolean;
   }[];
   dimensionPreview:
     | (CanvasDimensionPreview & {
@@ -150,6 +156,7 @@ type DimensionPaint = CanvasDimension & {
   da?: XY;
   db?: XY;
   leader?: boolean;
+  selected?: boolean;
   arc?: { center: XY; start: number; sweep: number; radius: number };
 };
 
@@ -413,6 +420,7 @@ export class CanvasRenderer {
             maxY: p.y,
             point: p,
             kind: "midpoint",
+            binding: { kind: "midpoint", refs: [e.id] },
             pointIds: e.points.map((point) => point.id),
             entityId: e.id,
             sketchId: sk.id,
@@ -486,6 +494,7 @@ export class CanvasRenderer {
       frame.grid,
       frame.unit,
       frame.selection,
+      frame.dimensionSelection,
       frame.dimensionPreview?.constraintId,
     ]);
     const baseRebuilt = key !== this.baseKey;
@@ -743,6 +752,7 @@ export class CanvasRenderer {
       text: d.text,
       x: d.x,
       y: d.y,
+      selected: d.selected === true,
       bounds: {
         minX: d.rect.x,
         minY: d.rect.y,
@@ -812,11 +822,25 @@ export class CanvasRenderer {
         this.entityRefs.get(ref),
       referencePoint = (_sk: Sketch, ref: string) =>
         this.pointRefs.get(ref) ?? this.entityRefs.get(ref)?.points[0];
+    const labelReferences = {
+      entity: (ref: string) => {
+        const e = this.entityRefs.get(ref);
+        return e?.id === ref ? e : undefined;
+      },
+      point: (ref: string) =>
+        this.pointRefs.get(ref) ?? this.entityRefs.get(ref)?.points[0],
+    };
     for (const sk of this.sketches) {
       if (!sk.visible) continue;
       const constraints: Pick<
         Constraint,
-        "id" | "kind" | "refs" | "value" | "labelPosition"
+        | "id"
+        | "kind"
+        | "refs"
+        | "value"
+        | "labelPosition"
+        | "labelOffset"
+        | "angleSector"
       >[] = preview
         ? sk.id === this.activeId
           ? [{ id: "__dimension_preview__", ...preview }]
@@ -838,7 +862,10 @@ export class CanvasRenderer {
           continue;
         const e = this.entityRefs.get(c.refs[0]);
         if (!e) continue;
-        const placed = c.labelPosition ? screen(c.labelPosition) : undefined;
+        const placement = preview
+          ? c.labelPosition
+          : dimensionLabelPosition(c, labelReferences);
+        const placed = placement ? screen(placement) : undefined;
         let a: XY,
           b: XY,
           label: XY,
@@ -848,10 +875,13 @@ export class CanvasRenderer {
           value = c.value ?? 0,
           text: string;
         if (c.kind === "angle" && e.points.length >= 2) {
-          const f = angleDimensionFrame(
-              e,
-              c.refs[1] ? resolveEntity(sk, c.refs[1]) : undefined,
-            ),
+          const other = c.refs[1] ? resolveEntity(sk, c.refs[1]) : undefined,
+            sector =
+              c.angleSector ??
+              (preview && other?.kind === "line"
+                ? selectAngleSector(e, other, c.labelPosition)
+                : undefined),
+            f = angleDimensionFrame(e, other, sector),
             center = screen(f.vertex),
             start = -f.start,
             sweep = -f.sweep,
@@ -871,7 +901,7 @@ export class CanvasRenderer {
             x: center.x + Math.cos(start + sweep / 2) * (radius + 18),
             y: center.y + Math.sin(start + sweep / 2) * (radius + 18),
           };
-          text = `${Number((c.value ?? (f.sweep * 180) / Math.PI).toFixed(1))}\u00b0`;
+          text = `${Number((c.value ?? ((sector ? Math.abs(f.sweep) : f.sweep) * 180) / Math.PI).toFixed(1))}\u00b0`;
         } else {
           if (c.kind === "lineDistance") {
             const point = referencePoint(sk, c.refs[0]) ?? e.points[0],
@@ -994,6 +1024,7 @@ export class CanvasRenderer {
           db,
           arc,
           leader: c.kind === "radius" || c.kind === "diameter",
+          selected: c.id === frame.dimensionSelection,
         });
       }
     }
@@ -1005,7 +1036,7 @@ export class CanvasRenderer {
     preview = false,
   ) {
     ctx.save();
-    const color = preview ? "#499ca7" : "#659a86";
+    const color = preview ? "#499ca7" : d.selected ? "#c08a29" : "#659a86";
     ctx.strokeStyle = color;
     ctx.lineWidth = 1;
     if (d.arc) {
@@ -1030,12 +1061,12 @@ export class CanvasRenderer {
       if (d.leader) segments(ctx, [[d.b!, d.label]]);
     }
     ctx.globalAlpha = 0.96;
-    ctx.fillStyle = "#f8faf9";
+    ctx.fillStyle = d.selected ? "#fff7e6" : "#f8faf9";
     ctx.beginPath();
     ctx.roundRect(d.rect.x, d.rect.y, d.rect.width, 20, 3);
     ctx.fill();
     ctx.globalAlpha = 1;
-    ctx.fillStyle = "#397b65";
+    ctx.fillStyle = d.selected ? "#8a5f12" : "#397b65";
     ctx.font = "12px Arial, sans-serif";
     ctx.textAlign = "center";
     ctx.textBaseline = "alphabetic";
@@ -1441,7 +1472,12 @@ export class CanvasRenderer {
         distance = d;
         bestOrder = order;
         bestPriority = priority;
-        best = { point: p.point, ref: p.ref, kind: p.kind };
+        best = {
+          point: p.point,
+          ref: p.ref,
+          binding: p.binding,
+          kind: p.kind,
+        };
       }
     };
     const region = {
@@ -1503,7 +1539,16 @@ export class CanvasRenderer {
       if (options.tangent && frame.snapFrom)
         for (const item of curves)
           for (const point of tangentPoints(item.entity, frame.snapFrom))
-            offer({ point, kind: "tangent" }, item.order);
+            offer(
+              {
+                point,
+                kind: "tangent",
+                binding: item.entity.sourceId
+                  ? undefined
+                  : { kind: "tangent", refs: [item.entity.id] },
+              },
+              item.order,
+            );
       if (options.intersection)
         for (let i = 0; i < curves.length; i++)
           for (let j = i + 1; j < curves.length; j++) {
@@ -1515,10 +1560,25 @@ export class CanvasRenderer {
               points = intersections(a.entity, b.entity);
               this.intersectionCache.set(key, points);
             }
-            for (const point of points) offer({ point, kind: "intersection" });
+            for (const point of points)
+              offer({
+                point,
+                kind: "intersection",
+                binding:
+                  a.entity.sourceId || b.entity.sourceId
+                    ? undefined
+                    : {
+                        kind: "intersection",
+                        refs: [a.entity.id, b.entity.id],
+                      },
+              });
           }
     }
-    offer({ point: { x: 0, y: 0 }, kind: "origin" });
+    offer({
+      point: { x: 0, y: 0 },
+      kind: "origin",
+      binding: { kind: "origin", refs: [] },
+    });
     if (!best && options.grid) {
       const step = gridStepForScale(frame.view.scale);
       offer({

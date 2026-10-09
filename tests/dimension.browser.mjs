@@ -667,7 +667,7 @@ async function assertSavedLabel(session, constraint, previousLabel) {
 }
 
 /** Noncircular dimensions need an explicit blank-canvas placement, never a hidden extra pick. */
-async function placeDimension(session, world = { x: 0, y: -10 }) {
+async function placeDimension(session, world) {
   assert.equal(
     await editorOpen(session),
     false,
@@ -675,6 +675,13 @@ async function placeDimension(session, world = { x: 0, y: -10 }) {
   );
   const state = await metadata(session);
   assert(state.dimensionPreview, "a line dimension awaits placement");
+  world ??=
+    state.dimensionPreview.kind === "angle"
+      ? {
+          x: (state.dimensionPreview.x - state.origin.x) / state.scale,
+          y: (state.origin.y - state.dimensionPreview.y) / state.scale,
+        }
+      : { x: 0, y: -10 };
   assert.equal(
     state.dimensionPreview.fixed,
     false,
@@ -1450,7 +1457,8 @@ try {
           };
         };
         const target = await labelPoint("25");
-        const beforeEdit = constraintOf(await stored(session), "length");
+        const beforeEditDocument = await stored(session);
+        const beforeEdit = constraintOf(beforeEditDocument, "length");
         await resetDialogLog(session);
         await session.page.mouse.dblclick(target.x, target.y);
         const editor = await waitForEditor(session);
@@ -1469,9 +1477,26 @@ try {
         );
         assert.equal(constraint.value, 30, "driving value updated");
         assert.deepEqual(
-          constraint.labelPosition,
-          beforeEdit.labelPosition,
-          "double-click edit retains the placed label",
+          constraint.labelOffset,
+          beforeEdit.labelOffset,
+          "double-click edit retains the label's geometric offset",
+        );
+        const beforeEdge = byId(beforeEditDocument, "edge"),
+          afterEdge = byId(edited, "edge");
+        assert(
+          Math.abs(
+            pointLineDistance(
+              constraint.labelPosition,
+              afterEdge.points[0],
+              afterEdge.points[1],
+            ) -
+              pointLineDistance(
+                beforeEdit.labelPosition,
+                beforeEdge.points[0],
+                beforeEdge.points[1],
+              ),
+          ) < 1e-6,
+          "editing the driving length keeps the annotation-to-line gap",
         );
         assert(
           Math.abs(lengthOf(byId(edited, "edge")) - 30) < 1e-5,
@@ -1550,10 +1575,17 @@ try {
             .evaluate((element) => element.classList.contains("selected")),
           "修剪 entered its pick operation",
         );
+        // 修剪 now collects its target through the command parameter panel.
+        const trimPanel = session.page.getByTestId("parameter-panel");
+        await trimPanel.waitFor();
+        assert.equal(
+          await trimPanel.locator('button[type="submit"]').isDisabled(),
+          true,
+          "修剪 waits for its object and pick position",
+        );
         await escape(session);
-        // 偏移 opens its own parameter dialog when something is selected, so
-        // clear the selection first: the assertion below covers dimension
-        // actions only.
+        await trimPanel.waitFor({ state: "detached" });
+        // 偏移 uses the same panel, so it opens one even without a selection.
         await session.page.locator('button[title="选择"]').click();
         await settle(session);
         await clickWorld(session, { x: -40, y: -38 });
@@ -1570,12 +1602,20 @@ try {
           "false",
           "偏移 exits dimension mode",
         );
+        const offsetPanel = session.page.getByTestId("parameter-panel");
+        await offsetPanel.waitFor();
+        assert.equal(
+          await offsetPanel.locator('button[type="submit"]').isDisabled(),
+          true,
+          "偏移 opens its panel and waits for an object",
+        );
         assert.equal(
           await session.page.locator(".dialog").count(),
           0,
-          "偏移 without a selection opens no dialog",
+          "偏移 uses the parameter panel instead of a modal dialog",
         );
         await escape(session);
+        await offsetPanel.waitFor({ state: "detached" });
         await assertNoDialog(session, "tool switching");
         return { tools: ["直线", "修剪", "偏移"] };
       },
@@ -1751,6 +1791,76 @@ try {
           });
         }
         return { samples };
+      },
+    );
+  });
+
+  /* ------------------------------ pick-phase right-click cancellation */
+  await suite(MAIN, {}, async (session) => {
+    await check(
+      "Right click after the first pick cancels pending picks without panning",
+      async () => {
+        const before = await stored(session);
+        await activate(session);
+        const first = await handlePoint(session, "pairX_p0");
+        await clickPoint(session, first);
+        assert.equal(
+          normalizeStatus(await statusText(session)),
+          "尺寸:请选择第二个点",
+          "status asks for the second point after the first pick",
+        );
+        assert.equal(
+          await editorOpen(session),
+          false,
+          "the first pick has not opened the editor",
+        );
+        const view = await metadata(session);
+        const blank = await screenPoint(session, { x: 0, y: -10 });
+        await session.page.mouse.move(blank.x, blank.y);
+        await settle(session);
+        await session.page.mouse.down({ button: "right" });
+        await session.page.mouse.move(blank.x + 24, blank.y - 12, { steps: 4 });
+        await session.page.mouse.up({ button: "right" });
+        await settle(session);
+        const after = await metadata(session);
+        assert.deepEqual(
+          after.origin,
+          view.origin,
+          "right cancellation does not start panning",
+        );
+        assert.equal(
+          after.scale,
+          view.scale,
+          "right cancellation does not zoom",
+        );
+        assert.equal(
+          after.dimensionPreview,
+          null,
+          "right cancellation clears the pick preview",
+        );
+        assert.equal(
+          (await modeState(session)).pressed,
+          "false",
+          "right cancellation exits dimension mode",
+        );
+        assert.equal(
+          await editorOpen(session),
+          false,
+          "right cancellation opens no editor",
+        );
+        assert.deepEqual(
+          await stored(session),
+          before,
+          "cancelled first pick creates no dimension",
+        );
+        await activate(session);
+        assert.equal(
+          normalizeStatus(await statusText(session)),
+          "尺寸:点击几何或点",
+          "re-activation starts from a clean first-pick prompt",
+        );
+        await escape(session);
+        return { cancelledAfterFirstPick: true };
       },
     );
   });
@@ -2799,10 +2909,15 @@ try {
           await hoverWorld(session, item.other);
           await assertPreview(
             session,
-            pairPreview,
-            "confirmed pair survives a different hover",
+            item.kind === "angle"
+              ? { ...pairPreview, value: 135 }
+              : pairPreview,
+            "confirmed pair survives a different hover while selecting its angle sector",
           );
-          const placement = await placeDimension(session);
+          const placement = await placeDimension(
+            session,
+            item.kind === "angle" ? { x: 10, y: 5 } : undefined,
+          );
           assert.equal(
             placement.editor.value,
             String(item.value),
@@ -3769,9 +3884,26 @@ try {
             "saved-label interaction creates no extra dimension",
           );
           assert.deepEqual(
-            constraint.labelPosition,
-            original.labelPosition,
-            "saved-label interaction retains stored placement",
+            constraint.labelOffset,
+            original.labelOffset,
+            "saved-label interaction retains its geometric offset",
+          );
+          const oldEdge = byId(before, "edge"),
+            solvedEdge = byId(after, "edge");
+          assert(
+            Math.abs(
+              pointLineDistance(
+                constraint.labelPosition,
+                solvedEdge.points[0],
+                solvedEdge.points[1],
+              ) -
+                pointLineDistance(
+                  original.labelPosition,
+                  oldEdge.points[0],
+                  oldEdge.points[1],
+                ),
+            ) < 1e-6,
+            "saved-label interaction retains the annotation-to-geometry gap",
           );
           const savedLabel = await assertSavedLabel(
             session,
@@ -3837,6 +3969,270 @@ try {
       );
     }
   });
+
+  /* ----------------------------------------- geometry-relative placement */
+  const relativeLine = line("edge", [
+    [-20, 0],
+    [20, 0],
+  ]);
+  const relativeCircle = entity("circle", "relative-circle", [[0, 0]], {
+    radius: 10,
+  });
+  const relativeCases = [
+    {
+      kind: "length",
+      entities: [relativeLine],
+      refs: ["edge"],
+      value: 40,
+      placement: { x: 0, y: 8 },
+      actor: "edge",
+      start: { x: 5, y: 0 },
+    },
+    {
+      kind: "distanceX",
+      entities: [relativeLine],
+      refs: ["edge"],
+      value: 40,
+      placement: { x: 0, y: 8 },
+      actor: "edge",
+      start: { x: 5, y: 0 },
+    },
+    {
+      kind: "distanceY",
+      entities: [
+        line("edge", [
+          [0, -20],
+          [0, 20],
+        ]),
+      ],
+      refs: ["edge"],
+      value: 40,
+      placement: { x: 8, y: 0 },
+      actor: "edge",
+      start: { x: 0, y: 5 },
+    },
+    {
+      kind: "lineDistance",
+      entities: [relativeLine, entity("point", "probe", [[0, 10]])],
+      refs: ["probe_p0", "edge"],
+      value: 10,
+      placement: { x: 8, y: 5 },
+      actor: "edge",
+      start: { x: 5, y: 0 },
+    },
+    {
+      kind: "angle",
+      entities: [
+        relativeLine,
+        line("axis", [
+          [0, -20],
+          [0, 20],
+        ]),
+      ],
+      refs: ["edge", "axis"],
+      value: 90,
+      placement: { x: 10, y: 10 },
+      actor: "edge",
+      start: { x: 5, y: 0 },
+    },
+    {
+      kind: "radius",
+      entities: [relativeCircle],
+      refs: ["relative-circle"],
+      value: 10,
+      placement: { x: 16, y: 4 },
+      actor: "relative-circle",
+      start: { x: 0, y: 0 },
+    },
+    {
+      kind: "diameter",
+      entities: [relativeCircle],
+      refs: ["relative-circle"],
+      value: 20,
+      placement: { x: 16, y: 4 },
+      actor: "relative-circle",
+      start: { x: 0, y: 0 },
+    },
+  ];
+  for (const sample of relativeCases) {
+    await suite(
+      documentFixture(sample.entities, [
+        {
+          id: "relative-label",
+          kind: sample.kind,
+          refs: sample.refs,
+          value: sample.value,
+          labelPosition: sample.placement,
+        },
+      ]),
+      {},
+      async (session) => {
+        await check(
+          `Geometry-relative ${sample.kind} follows movement and preserves its offset`,
+          async () => {
+            const snapButton = session.page
+              .locator(".bottom-actions")
+              .getByRole("button", { name: "切换吸附", exact: true });
+            if ((await snapButton.getAttribute("aria-pressed")) === "true")
+              await snapButton.click();
+            await settle(session);
+            const before = await stored(session),
+              original = sketchOf(before).constraints[0];
+            assert(
+              original.labelOffset,
+              "legacy placement gets a geometry-relative offset",
+            );
+            const originalLabel = await assertSavedLabel(session, original);
+            const from = await screenPoint(session, sample.start),
+              to = await screenPoint(session, {
+                x: sample.start.x + 1.5,
+                y: sample.start.y + 3,
+              });
+            await session.page.mouse.move(from.x, from.y);
+            await session.page.mouse.down();
+            await session.page.mouse.move(to.x, to.y, { steps: 8 });
+            await settle(session);
+            const liveState = await metadata(session),
+              liveLabel = liveState.dimensions.find(
+                (item) => item.id === original.id,
+              );
+            assert(liveLabel, "annotation remains visible during movement");
+            await session.page.mouse.up();
+            await settle(session);
+            const moved = await stored(session),
+              placed = sketchOf(moved).constraints[0],
+              beforePoint = byId(before, sample.actor).points[0],
+              afterPoint = byId(moved, sample.actor).points[0],
+              delta = {
+                x: afterPoint.x - beforePoint.x,
+                y: afterPoint.y - beforePoint.y,
+              };
+            assert(Math.hypot(delta.x, delta.y) > 1, "geometry really moves");
+            const movedLabel = await assertSavedLabel(session, placed);
+            assertPointClose(
+              movedLabel.world,
+              {
+                x: originalLabel.world.x + delta.x,
+                y: originalLabel.world.y + delta.y,
+              },
+              "annotation follows the same geometry movement",
+            );
+            assert.deepEqual(
+              placed.labelOffset,
+              original.labelOffset,
+              "geometry movement keeps the relative offset unchanged",
+            );
+            assert.equal(
+              placed.value,
+              original.value,
+              "annotation movement does not change its driving value",
+            );
+            assertPointClose(
+              {
+                x: (liveLabel.x - liveState.origin.x) / liveState.scale,
+                y: (liveState.origin.y - liveLabel.y) / liveState.scale,
+              },
+              movedLabel.world,
+              "annotation follows during the drag, not just after release",
+            );
+            await session.page.keyboard.press("Control+z");
+            await settle(session);
+            const undone = await stored(session);
+            assert.deepEqual(
+              undone,
+              before,
+              "undo restores geometry and its relative annotation together",
+            );
+            await session.page.keyboard.press("Control+Shift+z");
+            await settle(session);
+            assert.deepEqual(
+              await stored(session),
+              moved,
+              "redo restores geometry and annotation together",
+            );
+            await reseed(session, moved);
+            const restored = await stored(session);
+            assert.deepEqual(
+              restored,
+              moved,
+              "relative annotation survives document reload",
+            );
+            await assertSavedLabel(
+              session,
+              sketchOf(restored).constraints[0],
+              movedLabel,
+            );
+            if (sample.kind === "length") {
+              const edge = byId(restored, sample.actor);
+              await clickWorld(session, {
+                x: (edge.points[0].x + edge.points[1].x) / 2,
+                y: (edge.points[0].y + edge.points[1].y) / 2 - 5,
+              });
+              await activate(session);
+              const label = await dimensionLabelTarget(session, original.id),
+                mid = {
+                  x:
+                    (byId(restored, sample.actor).points[0].x +
+                      byId(restored, sample.actor).points[1].x) /
+                    2,
+                  y:
+                    (byId(restored, sample.actor).points[0].y +
+                      byId(restored, sample.actor).points[1].y) /
+                    2,
+                },
+                target = await screenPoint(session, {
+                  x: mid.x,
+                  y: mid.y + 10,
+                });
+              await session.page.mouse.move(label.x, label.y);
+              await session.page.mouse.down();
+              await session.page.mouse.move(target.x, target.y, { steps: 8 });
+              await session.page.mouse.up();
+              await settle(session);
+              await escape(session);
+              const relabelled = await stored(session),
+                changed = sketchOf(relabelled).constraints[0];
+              assert(
+                Math.abs(changed.labelOffset.y - 10) < 1e-4,
+                "dragging the label stores the new ten-unit gap",
+              );
+              const relabelledLabel = await assertSavedLabel(session, changed);
+              const a = await screenPoint(session, { x: mid.x + 5, y: mid.y }),
+                b = await screenPoint(session, { x: mid.x + 2, y: mid.y - 2 });
+              await session.page.mouse.move(a.x, a.y);
+              await session.page.mouse.down();
+              await session.page.mouse.move(b.x, b.y, { steps: 8 });
+              await session.page.mouse.up();
+              await settle(session);
+              const twice = await stored(session),
+                newPoint = byId(twice, sample.actor).points[0],
+                oldPoint = byId(relabelled, sample.actor).points[0],
+                twicePlaced = sketchOf(twice).constraints[0];
+              const twiceLabel = await assertSavedLabel(session, twicePlaced);
+              assertPointClose(
+                twiceLabel.world,
+                {
+                  x: relabelledLabel.world.x + newPoint.x - oldPoint.x,
+                  y: relabelledLabel.world.y + newPoint.y - oldPoint.y,
+                },
+                "later geometry movement keeps the manually adjusted gap",
+              );
+              assert.deepEqual(twicePlaced.labelOffset, changed.labelOffset);
+              await session.page.screenshot({
+                path: path.join(output, "relative-dimension-follow.png"),
+              });
+            }
+            return {
+              kind: sample.kind,
+              delta,
+              labelOffset: placed.labelOffset,
+              labelPosition: placed.labelPosition,
+            };
+          },
+        );
+      },
+    );
+  }
 
   /* ---------------------------------------- saved annotation positioning */
   const POSITIONED_MOUSE = documentFixture(
@@ -4014,13 +4410,15 @@ try {
           "drag preserves the expression",
         );
         const expected = structuredClone(before);
-        sketchOf(expected).constraints.find(
+        const adjustedExpected = sketchOf(expected).constraints.find(
           (item) => item.id === constraint.id,
-        ).labelPosition = adjusted.labelPosition;
+        );
+        adjustedExpected.labelPosition = adjusted.labelPosition;
+        adjustedExpected.labelOffset = adjusted.labelOffset;
         assert.deepEqual(
           after,
           expected,
-          "release changes only labelPosition, not geometry or value",
+          "release changes only label placement, not geometry or value",
         );
         assert.equal(
           (await modeState(session)).pressed,
@@ -4132,11 +4530,10 @@ try {
     );
 
     await check(
-      "Annotation clicks stay inert; active native double click adds no position history",
+      "Select mode selects, drags and deletes annotations; active double click adds no position history",
       async () => {
         await reseed(session, POSITIONED_MOUSE);
         const idle = await stored(session);
-        const idleDimensions = (await metadata(session)).dimensions;
         const idleLabel = await dimensionLabelTarget(
           session,
           "c_position_length",
@@ -4152,32 +4549,119 @@ try {
           null,
           "normal single click does not start adjustment",
         );
-        const idleTarget = await roundedWorldTarget(session, { x: 0, y: -8 });
-        await session.page.mouse.move(idleLabel.x, idleLabel.y);
-        await session.page.mouse.down();
-        await session.page.mouse.move(idleTarget.x, idleTarget.y, { steps: 6 });
-        await settle(session);
         assert.equal(
-          (await metadata(session)).dimensionPreview,
-          null,
-          "inactive dimension mode cannot drag annotations",
-        );
-        await session.page.mouse.up();
-        await settle(session);
-        assert.deepEqual(
-          await stored(session),
-          idle,
-          "inactive annotation drag leaves position and document unchanged",
-        );
-        assert.deepEqual(
-          (await metadata(session)).dimensions,
-          idleDimensions,
-          "inactive drag keeps saved labels",
+          (await metadata(session)).dimensions.find(
+            (item) => item.id === "c_position_length",
+          )?.selected,
+          true,
+          "single click selects the annotation",
         );
         assert.equal(
           (await modeState(session)).pressed,
           "false",
-          "inactive gesture does not enter dimension mode",
+          "selecting an annotation does not enter dimension mode",
+        );
+        assert(
+          await session.page.getByTestId("selected-dimension").isVisible(),
+          "properties panel shows the selected annotation",
+        );
+        assert.deepEqual(
+          await stored(session),
+          idle,
+          "selecting an annotation changes no document",
+        );
+        const empty = await roundedWorldTarget(session, { x: 0, y: -8 });
+        await clickPoint(session, empty);
+        assert.equal(
+          (await metadata(session)).dimensions.find(
+            (item) => item.id === "c_position_length",
+          )?.selected,
+          false,
+          "empty canvas click clears the annotation selection",
+        );
+        await clickPoint(session, idleLabel);
+        const idleTarget = await roundedWorldTarget(session, { x: 2, y: -8 });
+        await session.page.mouse.move(idleLabel.x, idleLabel.y);
+        await session.page.mouse.down();
+        await session.page.mouse.move(idleTarget.x, idleTarget.y, { steps: 6 });
+        await settle(session);
+        assert(
+          (await metadata(session)).dimensionPreview,
+          "select-mode drag previews the moved annotation",
+        );
+        await session.page.mouse.up();
+        await settle(session);
+        const dragged = await stored(session);
+        assert.notDeepEqual(
+          dragged,
+          idle,
+          "select-mode drag repositions the annotation",
+        );
+        assertPointClose(
+          sketchOf(dragged).constraints.find(
+            (item) => item.id === "c_position_length",
+          ).labelPosition,
+          idleTarget.world,
+          "release commits the dragged label position",
+          1e-4,
+        );
+        assert.equal(
+          (await modeState(session)).pressed,
+          "false",
+          "select-mode annotation drag does not enter dimension mode",
+        );
+        assert.equal(
+          (await metadata(session)).dimensionPreview,
+          null,
+          "drag preview clears after release",
+        );
+        await session.page.keyboard.press("Control+z");
+        await settle(session);
+        assert.deepEqual(
+          await stored(session),
+          idle,
+          "undo restores the annotation position",
+        );
+        await session.page.keyboard.press("Control+Shift+z");
+        await settle(session);
+        assert.deepEqual(
+          await stored(session),
+          dragged,
+          "redo restores the dragged annotation position",
+        );
+        await clickPoint(
+          session,
+          await dimensionLabelTarget(session, "c_position_length"),
+        );
+        await session.page.keyboard.press("Delete");
+        await settle(session);
+        const deleted = await stored(session);
+        assert.equal(
+          sketchOf(deleted).constraints.some(
+            (item) => item.id === "c_position_length",
+          ),
+          false,
+          "Delete removes the selected annotation",
+        );
+        assert.equal(
+          sketchOf(deleted).constraints.some(
+            (item) => item.id === "c_other_length",
+          ),
+          true,
+          "Delete keeps unselected annotations",
+        );
+        await clickPoint(
+          session,
+          await dimensionLabelTarget(session, "c_other_length"),
+        );
+        await session.page
+          .getByRole("button", { name: "删除选中对象", exact: true })
+          .click();
+        await settle(session);
+        assert.equal(
+          sketchOf(await stored(session)).constraints.length,
+          0,
+          "the properties delete button removes the selected annotation",
         );
 
         await reseed(session, POSITIONED_MOUSE);
@@ -4382,10 +4866,11 @@ try {
         const expected = structuredClone(before);
         constraintOf(expected, "diameter").labelPosition =
           adjusted.labelPosition;
+        constraintOf(expected, "diameter").labelOffset = adjusted.labelOffset;
         assert.deepEqual(
           after,
           expected,
-          "circular drag changes only labelPosition, not radius, value, or expression",
+          "circular drag changes only label placement, not radius, value, or expression",
         );
         const rendered = await assertSavedLabel(session, adjusted);
         assertPointClose(

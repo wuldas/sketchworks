@@ -14,6 +14,18 @@ export type DragFeedback = { ok: boolean; point?: XY };
 export const sameDragPosition = (a: XY | null, b: XY) =>
   !!a && dist(a, b) <= 1e-7;
 
+/** Whole-entity multiselections keep their group when the grip hits a handle. */
+export function resolveDragSelection(
+  hit: Selection,
+  selection: readonly Selection[],
+): Selection {
+  if (!hit.pointId || selection.some((item) => item.pointId)) return hit;
+  const entities = new Set(selection.map((item) => item.entityId));
+  return entities.size > 1 && entities.has(hit.entityId)
+    ? { entityId: hit.entityId }
+    : hit;
+}
+
 export function dragAnchor(
   sketch: Sketch,
   selected: Selection,
@@ -53,7 +65,7 @@ export function dragAnchor(
   for (const item of sketch.entities)
     if (item.kind === "arc") link(item.points.map((point) => point.id));
   for (const constraint of sketch.constraints) {
-    if (constraint.kind === "fixed") {
+    if (constraint.kind === "fixed" || constraint.kind === "origin") {
       for (const ref of constraint.refs)
         for (const id of refPoints(ref)) fixed.add(id);
       continue;

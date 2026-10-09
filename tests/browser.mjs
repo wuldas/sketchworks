@@ -423,16 +423,27 @@ async function parameterChecks() {
       await selectEntity(4);
       await button("创建").click();
       await button("矩形阵列").click();
-      await page.getByRole("textbox", { name: "列数", exact: true }).fill("3");
-      await page.getByRole("textbox", { name: "行数", exact: true }).fill("1");
-      await page
-        .getByRole("textbox", { name: "X 间距", exact: true })
+      const arrayPanel = page.getByTestId("parameter-panel");
+      await arrayPanel.waitFor();
+      assert.equal(
+        (await arrayPanel.locator(".geometry-pick span").first().innerText()).trim(),
+        "已选择 1 个",
+        "the preselected object fills the 对象 parameter",
+      );
+      await arrayPanel
+        .getByRole("textbox", { name: "数量 1", exact: true })
+        .fill("3");
+      await arrayPanel
+        .getByRole("textbox", { name: "数量 2", exact: true })
+        .fill("1");
+      await arrayPanel
+        .getByRole("textbox", { name: "距离 1", exact: true })
         .fill("pitch");
-      await page
-        .getByRole("textbox", { name: "Y 间距", exact: true })
+      await arrayPanel
+        .getByRole("textbox", { name: "距离 2", exact: true })
         .fill("0");
-      await button("确定").click();
-      await page.locator(".dialog").waitFor({ state: "hidden" });
+      await arrayPanel.locator('button[type="submit"]').click();
+      await arrayPanel.waitFor({ state: "detached" });
       sk = geometry(await saved());
       assert.equal(sk.entities.length, 8);
       const sourceId = sk.entities[4].id;
@@ -622,8 +633,9 @@ try {
     const sk = geometry(await saved());
     assert(Math.abs(length(sk.entities[5]) - 16) < 1e-5);
     assert.deepEqual(
-      sk.constraints.find((c) => c.id === before.id).labelPosition,
-      before.labelPosition,
+      sk.constraints.find((c) => c.id === before.id).labelOffset,
+      before.labelOffset,
+      "editing the value retains geometry-relative placement",
     );
   });
   await check(
@@ -651,6 +663,20 @@ try {
   await check("Fixed circle does not move on drag", async () => {
     await selectEntity(4);
     await button("固定").first().click();
+    const fixPanel = page.getByTestId("parameter-panel");
+    await fixPanel.waitFor();
+    assert.notEqual(
+      (await fixPanel.locator(".geometry-pick span").first().innerText()).trim(),
+      "选择",
+      "the fixed constraint preselects the object",
+    );
+    assert.equal(
+      await fixPanel.locator('button[type="submit"]').isDisabled(),
+      false,
+      "the fixed constraint is ready to commit",
+    );
+    await fixPanel.locator('button[type="submit"]').click();
+    await fixPanel.waitFor({ state: "detached" });
     const before = geometry(await saved()).entities[4];
     await dragHandle(before.points[0].id, 50, 40);
     const after = geometry(await saved()).entities[4];

@@ -603,6 +603,23 @@ async function stopRecording(session, name) {
   );
   return capture;
 }
+async function boxSelectMembers(session, ids) {
+  const from = await screen(session, { x: -40, y: 32 }),
+    to = await screen(session, { x: 35, y: -30 });
+  await session.page.mouse.move(from.x, from.y);
+  await session.page.mouse.down();
+  await session.page.mouse.move(to.x, to.y, { steps: 6 });
+  await session.page.mouse.up();
+  await settle(session);
+  const selected = await session.page
+    .locator(".entity-row.selected")
+    .evaluateAll((rows) => rows.map((row) => row.getAttribute("title")));
+  assert.deepEqual(
+    selected.sort(),
+    [...ids].sort(),
+    "marquee selects all requested whole entities",
+  );
+}
 async function selectMembers(session, ids) {
   for (let i = 0; i < ids.length; i++) {
     await session.page
@@ -966,11 +983,19 @@ async function exercise(
     projected = false,
   } = {},
 ) {
-  if (!grid)
+  if (!grid) {
     await session.page
       .getByRole("checkbox", { name: "\u7f51\u683c", exact: true })
       .uncheck();
-  if (spec.multiselect) await selectMembers(session, spec.ids);
+    const gridCapture = session.page.locator(".bottom-actions").getByRole("button", { name: "\u7f51\u683c\u6355\u83b7", exact: true });
+    if ((await gridCapture.getAttribute("aria-pressed")) === "true") await gridCapture.click();
+  }
+  if (!grid && !endpoint)
+    await session.page
+      .getByRole("checkbox", { name: "\u5438\u9644", exact: true })
+      .uncheck();
+  if (spec.boxselect) await boxSelectMembers(session, spec.ids);
+  else if (spec.multiselect) await selectMembers(session, spec.ids);
   await settle(session);
   const before = await saved(session);
   const observedIds = spec.observedIds || spec.ids;
@@ -984,6 +1009,12 @@ async function exercise(
   });
   await session.page.mouse.down();
   await settle(session);
+  if (spec.boxselect)
+    assert.equal(
+      await session.page.locator(".entity-row.selected").count(),
+      spec.ids.length,
+      "handle press preserves the complete marquee selection",
+    );
   const samples = [];
   for (let i = 1; i <= 15; i++) {
     const delta = { x: i * 1.2, y: -i * 0.75 };
@@ -1146,6 +1177,7 @@ async function exercise(
           baseline,
           "one undo must restore every group member",
         );
+        if (spec.boxselect) await selectMembers(session, spec.ids);
         await assertRenderedPose(session, undone, observedIds);
         await session.page
           .getByRole("button", {
@@ -1159,6 +1191,7 @@ async function exercise(
           pointsOf(after, observedIds),
           "redo must restore final group pose",
         );
+        if (spec.boxselect) await selectMembers(session, spec.ids);
         await assertRenderedPose(session, redone, observedIds);
       }
     }
@@ -1287,7 +1320,155 @@ const chain = {
   grab: { x: -17.3, y: 11.7 },
   probes: [{ x: -20.5, y: 10.5 }],
 };
+const mixedGrips = [
+  entity("line", "mixed-line", [
+    [-26, 8],
+    [-14, 15],
+  ]),
+  entity("circle", "mixed-circle", [[-21, 16]], { radius: 5 }),
+  entity(
+    "arc",
+    "mixed-arc",
+    [
+      [-21, 13],
+      [-16, 13],
+      [-21, 18],
+    ],
+    { radius: 5, ccw: true },
+  ),
+  entity(
+    "ellipse",
+    "mixed-ellipse",
+    [
+      [-22, 14],
+      [-15, 14],
+    ],
+    { ry: 4 },
+  ),
+  entity("spline", "mixed-spline", [
+    [-28, 8],
+    [-23, 19],
+    [-18, 5],
+    [-12, 15],
+  ]),
+  entity("bezier", "mixed-bezier", [
+    [-28, 8],
+    [-27, 21],
+    [-17, 4],
+    [-12, 15],
+  ]),
+  entity(
+    "conic",
+    "mixed-conic",
+    [
+      [-28, 8],
+      [-22, 21],
+      [-12, 10],
+    ],
+    { weight: 0.65 },
+  ),
+  entity("point", "mixed-point", [[-21, 16]]),
+  entity("text", "mixed-text", [[-23, 12]], {
+    text: "ABC",
+    fontSize: 3,
+    rotation: 15,
+  }),
+];
+const mixedPeers = () => [
+  entity("line", "peer-line", [
+    [15, -10],
+    [25, -8],
+  ]),
+  entity("point", "peer-point", [[24, 22]]),
+];
 try {
+  for (const primary of mixedGrips) {
+    for (let index = 0; index < primary.points.length; index++) {
+      const name = `marquee-${primary.kind}-handle-${index}`;
+      await check(
+        name,
+        documentFixture([primary, ...mixedPeers()]),
+        {
+          ids: [primary.id, "peer-line", "peer-point"],
+          anchorId: primary.points[0].id,
+          grab: primary.points[index],
+          boxselect: true,
+          rigid: true,
+        },
+        { history: index === 0 },
+      );
+    }
+  }
+  const mixedCircle = mixedGrips.find((e) => e.kind === "circle");
+  const circleGroup = {
+    ids: [mixedCircle.id, "peer-line", "peer-point"],
+    anchorId: mixedCircle.points[0].id,
+    grab: mixedCircle.points[0],
+    boxselect: true,
+    rigid: true,
+  };
+  await check(
+    "marquee-circle-control-cancel",
+    documentFixture([mixedCircle, ...mixedPeers()]),
+    circleGroup,
+    { cancel: true },
+  );
+  await check(
+    "marquee-circle-fixed-peer",
+    documentFixture(
+      [mixedCircle, ...mixedPeers()],
+      [{ id: "peer-fixed", kind: "fixed", refs: ["peer-line"] }],
+    ),
+    circleGroup,
+    { rejected: true },
+  );
+  await check(
+    "marquee-circle-control-dpr2",
+    documentFixture([mixedCircle, ...mixedPeers()]),
+    circleGroup,
+    { dpr: 2, history: true },
+  );
+  await check(
+    "marquee-circle-body",
+    documentFixture([mixedCircle, ...mixedPeers()]),
+    {
+      ...circleGroup,
+      grab: {
+        x: mixedCircle.points[0].x + mixedCircle.radius,
+        y: mixedCircle.points[0].y,
+      },
+    },
+    { history: true },
+  );
+  await check(
+    "marquee-circle-grid-capture",
+    documentFixture([mixedCircle, ...mixedPeers()]),
+    circleGroup,
+    { grid: true, history: true },
+  );
+  const circleEndpointDoc = documentFixture(
+    [
+      mixedCircle,
+      ...mixedPeers(),
+      entity("line", "external-capture", [
+        [6.7, -8.3],
+        [60, -8.3],
+      ]),
+    ],
+    [
+      {
+        id: "external-capture-fixed",
+        kind: "fixed",
+        refs: ["external-capture"],
+      },
+    ],
+  );
+  await check(
+    "marquee-circle-endpoint-capture",
+    circleEndpointDoc,
+    circleGroup,
+    { endpoint: true, history: true },
+  );
   await check("rectangle-single-edge", rectangle(), rect);
   await check(
     "rectangle-all-members",

@@ -71,6 +71,7 @@ import {
   type XY,
   type ConstraintKind,
   type Constraint,
+  type AngleSector,
   emptyDocument,
   demoDocument,
   clone,
@@ -102,6 +103,7 @@ import {
   toolLabels,
   toolClicks,
   createGeometry,
+  appendGeometry,
 } from "./creation";
 import {
   initSolver,
@@ -119,7 +121,11 @@ import {
 import { exportDxf, exportSvg, exportJson, download } from "./export";
 import { Viewport } from "./Viewport";
 import { appendSplinePoint } from "./splineDraft";
-import { defaultSnapOptions, type SnapOptions } from "./snapping";
+import {
+  defaultSnapOptions,
+  type SnapOptions,
+  type SnapReference,
+} from "./snapping";
 import {
   resolveDimension,
   selectionRefs,
@@ -127,6 +133,8 @@ import {
   isParallelPair,
   type DimensionPickMode,
 } from "./dimensionPick";
+import { placeDimensionLabel, updateDimensionLabels } from "./dimensionLabel";
+import { convertAngleSector, resolveAnglePlacement } from "./angleDimension";
 import { type DragEvent, type DragFeedback } from "./dragging";
 import {
   dragPosition,
@@ -134,6 +142,17 @@ import {
   resolveBodyDragEntities,
   type DragDriver,
 } from "./dragTransaction";
+import { ParameterPanel } from "./ParameterPanel";
+import {
+  type CommandSession,
+  commandGeometryError,
+  commandSelections,
+  constraintGeometry,
+  createCommandSession,
+  operationGeometry,
+  selectionKey,
+  updateCommandSelection,
+} from "./commandParameters";
 import "./app.css";
 const STORAGE = "sketchworks.document.v1";
 const DIRECTION_CONSTRAINTS: ConstraintKind[] = [
@@ -173,6 +192,9 @@ const constraintIcons: Record<ConstraintKind, LucideIcon> = {
   equal: Equal,
   fixed: LockKeyhole,
   onLine: ArrowDownToLine,
+  onCurve: Spline,
+  intersection: Crosshair,
+  origin: Crosshair,
   tangent: Tangent,
   concentric: CircleDot,
   midpoint: AlignHorizontalDistributeCenter,
@@ -183,6 +205,7 @@ const constraintIcons: Record<ConstraintKind, LucideIcon> = {
   distanceX: AlignHorizontalDistributeCenter,
   distanceY: AlignVerticalDistributeCenter,
   radius: CircleDot,
+  ellipseWidth: Circle,
   diameter: Circle,
   angle: Triangle,
 };
@@ -385,7 +408,7 @@ export default function App() {
     [selection, setSelection] = useState<Selection[]>([]),
     [tool, setTool] = useState<Tool>("select"),
     [drafts, setDrafts] = useState<XY[]>([]),
-    draftSnaps = useRef<(string | undefined)[]>([]),
+    draftSnaps = useRef<(SnapReference | undefined)[]>([]),
     draftCaptured = useRef(false);
   const [config, setConfig] = useState<CreateConfig>(defaultConfig),
     [ready, setReady] = useState(false),
@@ -407,7 +430,7 @@ export default function App() {
     [historyVersion, setHistoryVersion] = useState(0),
     [leftOpen, setLeftOpen] = useState(window.innerWidth > 960),
     [rightOpen, setRightOpen] = useState(window.innerWidth > 1100),
-    [pickOperation, setPickOperation] = useState<string | undefined>(),
+    [command, setCommand] = useState<CommandSession | null>(null),
     [dimensionMode, setDimensionMode] = useState(false),
     [dimensionKindMode, setDimensionKindMode] =
       useState<DimensionPickMode>("auto"),
@@ -421,10 +444,14 @@ export default function App() {
       refs: string[];
       anchor?: XY;
       labelPosition?: XY;
+      angleSector?: AngleSector;
       preserveParallel?: boolean;
       value: string;
       unit: string;
-    } | null>(null);
+    } | null>(null),
+    [selectedDimensionId, setSelectedDimensionId] = useState<string | null>(
+      null,
+    );
   const history = useRef<Document[]>([]),
     future = useRef<Document[]>([]),
     dragBefore = useRef<Document | null>(null),
@@ -446,9 +473,13 @@ export default function App() {
     dimensionMode && !dimensionDraft && !dimensionAdjustment
       ? resolveDimension(sketch, dimensionPicks, dimensionKindMode)
       : null;
+  const displayedSelection = command ? commandSelections(command) : selection;
   const selectedEntities = sketch.entities.filter((e) =>
-    selection.some((s) => s.entityId === e.id),
+    displayedSelection.some((s) => s.entityId === e.id),
   );
+  const selectedDimension = selectedDimensionId
+    ? sketch.constraints.find((c) => c.id === selectedDimensionId)
+    : undefined;
   const one = selectedEntities.length === 1 ? selectedEntities[0] : undefined;
   const unit = doc.unit === "in" ? "in" : "mm",
     factor = doc.unit === "in" ? 25.4 : 1;
@@ -489,6 +520,7 @@ export default function App() {
         });
       updateDerived(sk);
       validGeometry(sk);
+      updateDimensionLabels(sk);
       if (sk.id === solvingSketchId) current = result;
     }
     return current;
@@ -574,25 +606,25 @@ export default function App() {
       if (result.ok) setSolverState(result);
     }
   }, [activeId, ready]);
-  const setMode = (mode: Tool) => {
+  const setMode = (mode: Tool, restoreSelection = true) => {
     setTool(mode);
     setDrafts([]);
     draftSnaps.current = [];
     draftCaptured.current = false;
-    setPickOperation(undefined);
+    if (!restoreSelection) setSelection([]);
+    else if (command) setSelection(command.previousSelection);
+    setCommand(null);
     setDimensionMode(false);
     setDimensionDraft(null);
     setDimensionAdjustmentId(null);
     setDimensionPicks([]);
+    setSelectedDimensionId(null);
     setMenu(null);
   };
-  const cancel = () => {
-    setDrafts([]);
-    draftSnaps.current = [];
-    draftCaptured.current = false;
-    setPickOperation(undefined);
-    setMode("select");
-    setMenu(null);
+  const cancel = () => setMode("select");
+  const switchSketch = (id: string) => {
+    setMode("select", false);
+    setActiveId(id);
   };
   const undo = () => {
     const previous = history.current.pop();
@@ -604,6 +636,7 @@ export default function App() {
     setActiveId(previousSk);
     commit(previous, "撤销", false);
     setHistoryVersion((v) => v + 1);
+    setCommand(null);
     cancelDimensions();
     setSelection([]);
     setDrafts([]);
@@ -619,10 +652,37 @@ export default function App() {
     );
     commit(next, "重做", false);
     setHistoryVersion((v) => v + 1);
+    setCommand(null);
     cancelDimensions();
     setSelection([]);
   };
+  const removeSelectedDimension = () => {
+    const id = selectedDimensionId;
+    if (!id) return;
+    if (!sketch.constraints.some((c) => c.id === id)) {
+      setSelectedDimensionId(null);
+      return;
+    }
+    if (
+      transaction("删除尺寸", (_, s) => {
+        s.constraints = s.constraints.filter((item) => item.id !== id);
+      })
+    )
+      setSelectedDimensionId(null);
+  };
   const removeSelected = () => {
+    if (command) {
+      setCommand({
+        ...command,
+        geometry: command.geometry.map((p, i) =>
+          i === command.active
+            ? { ...p, selections: [], position: undefined }
+            : p,
+        ),
+      });
+      return;
+    }
+    if (selectedDimensionId) return removeSelectedDimension();
     if (!selection.length) return;
     if (
       transaction("删除", (_, s) =>
@@ -646,6 +706,25 @@ export default function App() {
       if ((e.target as HTMLElement)?.matches("input,textarea,select") || modal)
         return;
       const key = e.key.toLowerCase();
+      if (command) {
+        if (key === "escape") {
+          e.preventDefault();
+          cancel();
+        } else if (key === "enter") {
+          e.preventDefault();
+          confirmCommand();
+        } else if (key === "delete" || key === "backspace") {
+          e.preventDefault();
+          removeSelected();
+        } else if ((e.ctrlKey || e.metaKey) && key === "a") {
+          e.preventDefault();
+          changeCommandSelection(
+            sketch.entities.map((e) => ({ entityId: e.id })),
+            "replace",
+          );
+        }
+        return;
+      }
       if ((e.ctrlKey || e.metaKey) && key === "z") {
         e.preventDefault();
         e.shiftKey ? redo() : undo();
@@ -687,9 +766,33 @@ export default function App() {
     window.addEventListener("keydown", handler);
     return () => window.removeEventListener("keydown", handler);
   });
+  useEffect(() => {
+    if (selection.length) setSelectedDimensionId(null);
+  }, [selection]);
+  const selectDimension = (id: string | null) => {
+    if (id && !sketch.constraints.some((c) => c.id === id)) return;
+    if (id) setSelection([]);
+    setSelectedDimensionId(id);
+  };
+  const changeCommandSelection = (
+    picks: Selection[],
+    mode: "toggle" | "replace" | "append" = "toggle",
+  ) => {
+    if (!command) return;
+    const result = updateCommandSelection(command, sketch, picks, mode);
+    if (result.error) notify(result.error, true);
+    else setCommand(result.session);
+  };
   const select = (s: Selection | null, additive: boolean) => {
+    if (command) {
+      if (s) changeCommandSelection([s]);
+      return;
+    }
     if (!s) {
-      if (!additive) setSelection([]);
+      if (!additive) {
+        setSelection([]);
+        setSelectedDimensionId(null);
+      }
       return;
     }
     setSelection((prev) =>
@@ -703,45 +806,52 @@ export default function App() {
     );
   };
   const refs = selection.map((s) => s.pointId ?? s.entityId);
-  const addConstraint = (
-    kind: ConstraintKind,
-    value?: number,
-    expression?: string,
-    existingId?: string,
-  ) =>
-    transaction(constraintLabels[kind], (_, s) => {
-      if (
-        selection.some(
-          (sel) => s.entities.find((e) => e.id === sel.entityId)?.sourceId,
-        )
-      )
-        throw new Error("派生对象须先解除关联");
-      const invalid = canConstrain(s, kind, refs);
-      if (invalid && !existingId) throw new Error("选取的对象不适用于此约束");
-      if (existingId) {
-        const c = s.constraints.find((c) => c.id === existingId);
-        if (!c) throw new Error("尺寸不存在");
-        c.value = value;
-        c.expression = expression;
-        return;
-      }
-      if (
-        s.constraints.some(
-          (c) =>
-            c.kind === kind &&
-            c.refs.length === refs.length &&
-            c.refs.every((r) => refs.includes(r)),
-        )
-      )
-        throw new Error("此约束已经存在");
-      s.constraints.push({
-        id: uid("c"),
+  const startConstraint = (kind: ConstraintKind) => {
+    const previous = command?.previousSelection ?? selection;
+    setMode("select");
+    setCommand(
+      createCommandSession(
+        "constraint",
         kind,
-        refs: [...refs],
-        value,
-        expression,
-      });
+        constraintLabels[kind],
+        constraintGeometry(kind),
+        [],
+        sketch,
+        previous,
+      ),
+    );
+  };
+  const commandError = command
+    ? (commandGeometryError(command) ??
+      (command.type === "constraint" &&
+      canConstrain(
+        sketch,
+        command.name as ConstraintKind,
+        commandSelections(command).map(selectionKey),
+      )
+        ? "选取的对象不适用于此约束，请修改几何参数"
+        : null))
+    : null;
+  const pickCommand = (picked: Selection | null, point: XY) => {
+    if (!command) return;
+    const active = command.geometry[command.active];
+    if (active.kind !== "position") {
+      if (picked) changeCommandSelection([picked]);
+      return;
+    }
+    const values = { ...command.values };
+    if (active.optional) {
+      values.cx = String(point.x / factor);
+      values.cy = String(point.y / factor);
+    }
+    setCommand({
+      ...command,
+      values,
+      geometry: command.geometry.map((p, i) =>
+        i === command.active ? { ...p, position: { ...point } } : p,
+      ),
     });
+  };
   const dimensionValue = (kind: ConstraintKind, rs = refs): number => {
     const e = resolveEntity(sketch, rs[0]);
     if (!e) return 10;
@@ -812,13 +922,36 @@ export default function App() {
       existingId?: string;
       anchor?: XY;
       labelPosition?: XY;
+      angleSector?: AngleSector;
       preserveParallel?: boolean;
     },
   ) => {
     const existing = options?.existingId
       ? sketch.constraints.find((item) => item.id === options.existingId)
       : undefined;
-    const raw = existing?.value ?? dimensionValue(kind, targetRefs);
+    const angle =
+        kind === "angle"
+          ? resolveAnglePlacement(
+              sketch,
+              targetRefs,
+              options?.labelPosition ?? existing?.labelPosition,
+            )
+          : undefined,
+      angleSector =
+        existing?.angleSector ?? options?.angleSector ?? angle?.angleSector,
+      converted =
+        existing && angleSector && !existing.angleSector
+          ? convertAngleSector(
+              existing,
+              angleSector,
+              angle?.value ?? Math.abs(existing.value ?? 0),
+            )
+          : undefined,
+      raw =
+        converted?.value ??
+        existing?.value ??
+        angle?.value ??
+        dimensionValue(kind, targetRefs);
     setDimensionAdjustmentId(null);
     setDimensionDraft({
       constraintId: options?.existingId,
@@ -826,10 +959,11 @@ export default function App() {
       refs: targetRefs,
       anchor: options?.anchor ?? dimensionAnchorFor(targetRefs),
       labelPosition: options?.labelPosition ?? existing?.labelPosition,
+      angleSector,
       preserveParallel: options?.preserveParallel,
       unit: kind === "angle" ? "°" : unit,
       value:
-        existing?.expression ??
+        (converted ? converted.expression : existing?.expression) ??
         (kind === "angle" ? Number(raw.toFixed(3)).toString() : formatted(raw)),
     });
   };
@@ -837,6 +971,7 @@ export default function App() {
     setDimensionDraft(null);
     setDimensionAdjustmentId(null);
     setDimensionPicks([]);
+    setSelectedDimensionId(null);
     setDimensionMode(false);
   };
   const commitDimension = (text: string): boolean => {
@@ -855,6 +990,10 @@ export default function App() {
         draft.kind === "angle" ? "deg" : "mm",
       );
       if (!isExpression && draft.kind !== "angle") value *= factor;
+      if (draft.angleSector && (value < 0 || value >= 360))
+        throw new Error(
+          "角度应在 0° 至 360° 之间（不含 360°），方向由所选角度区域确定",
+        );
       const ok = transaction(
         draft.constraintId
           ? `编辑${constraintLabels[draft.kind]}`
@@ -867,6 +1006,10 @@ export default function App() {
             if (!current) throw new Error("尺寸不存在");
             current.value = value;
             current.expression = isExpression ? text : undefined;
+            if (draft.angleSector) {
+              if (!current.angleSector) delete current.labelOffset;
+              current.angleSector = draft.angleSector;
+            }
             return;
           }
           const live = draft.refs.filter((ref) => !!resolveEntity(target, ref));
@@ -890,6 +1033,7 @@ export default function App() {
             value,
             expression: isExpression ? text : undefined,
             labelPosition: draft.labelPosition,
+            angleSector: draft.angleSector,
           });
           // Only a confirmed line pair implies a parallelism constraint.
           if (draft.kind === "lineDistance" && draft.preserveParallel) {
@@ -944,7 +1088,8 @@ export default function App() {
     setDrafts([]);
     draftSnaps.current = [];
     draftCaptured.current = false;
-    setPickOperation(undefined);
+    if (command) setSelection(command.previousSelection);
+    setCommand(null);
     setMenu(null);
     setDimensionMode(true);
     setDimensionDraft(null);
@@ -966,17 +1111,17 @@ export default function App() {
     );
   };
   const adjustDimension = (id: string) => {
-    if (!dimensionMode || dimensionDraft) return;
+    if (dimensionDraft) return;
     if (!sketch.constraints.some((c) => c.id === id)) return;
     setDimensionPicks([]);
     setDimensionAdjustmentId(id);
   };
   const commitDimensionPosition = (id: string, world: XY) => {
-    if (!dimensionMode || dimensionDraft) return;
+    if (dimensionDraft) return;
     transaction("调整尺寸标注位置", (_, target) => {
       const c = target.constraints.find((item) => item.id === id);
       if (!c) throw new Error("尺寸不存在");
-      c.labelPosition = { ...world };
+      placeDimensionLabel(target, c, world);
     });
     setDimensionAdjustmentId(null);
   };
@@ -1021,7 +1166,7 @@ export default function App() {
   };
   const finishCreation = (
     points: XY[],
-    snaps: (string | undefined)[],
+    snaps: (SnapReference | undefined)[],
     mode = tool,
     preserveCapturedCoordinates = false,
   ) => {
@@ -1036,37 +1181,22 @@ export default function App() {
       return false;
     }
     const ok = transaction(toolLabels[mode], (_, s) => {
-      s.entities.push(...result.entities);
-      s.constraints.push(...result.constraints);
-      if (config.autoConstraint)
-        snaps.forEach((ref, index) => {
-          if (!ref) return;
-          const target =
-            mode === "spline"
-              ? result.entities[0].points[index]
-              : result.entities
-                  .flatMap((e) => e.points)
-                  .find((p) => dist(p, points[index]) < 1e-6);
-          if (
-            target &&
-            !s.constraints.some(
-              (c) =>
-                c.kind === "coincident" &&
-                c.refs.includes(target.id) &&
-                c.refs.includes(ref),
-            )
-          )
-            s.constraints.push({
-              id: uid("c"),
-              kind: "coincident",
-              refs: [target.id, ref],
-            });
-        });
+      appendGeometry(
+        s,
+        result,
+        snaps.flatMap((ref, pointIndex) =>
+          ref === undefined
+            ? []
+            : [{ pointIndex, ref, point: points[pointIndex] }],
+        ),
+        config.autoConstraint,
+        mode,
+      );
     });
     if (ok) setSelection([]);
     return ok;
   };
-  const place = (p: XY, snapRef?: string, captured = false) => {
+  const place = (p: XY, snapRef?: SnapReference, captured = false) => {
     if (tool === "select" || !ready) return;
     if (tool === "spline") {
       const next = appendSplinePoint(drafts, draftSnaps.current, p, snapRef);
@@ -1098,7 +1228,7 @@ export default function App() {
       draftCaptured.current = preserveCapturedCoordinates;
     }
   };
-  const finishSpline = (point?: XY, snapRef?: string) => {
+  const finishSpline = (point?: XY, snapRef?: SnapReference) => {
     const final = point
       ? appendSplinePoint(drafts, draftSnaps.current, point, snapRef)
       : { points: drafts, refs: draftSnaps.current };
@@ -1232,25 +1362,38 @@ export default function App() {
   const runOperation = (
     operation: string,
     values: Record<string, number>,
+    ids: string[],
     pick?: XY,
-    targetId?: string,
     expressions?: Record<string, string>,
   ) => {
     try {
       const next = clone(docRef.current),
         s = next.sketches.find((s) => s.id === activeId)!;
-      const ids = targetId ? [targetId] : selection.map((v) => v.entityId);
       const result = modifySketch(s, ids, operation, values, pick);
       if (expressions) {
         const beforeIds = new Set(sketch.entities.map((e) => e.id));
         for (const e of s.entities) {
           if (beforeIds.has(e.id) || !e.transform) continue;
           const t = e.transform;
-          if (operation === "rectangularArray") {
-            if (expressions.dx && Math.abs(values.dx) > 1e-9)
-              t.xExpression = `${(t.x ?? 0) / values.dx}*(${expressions.dx})`;
-            if (expressions.dy && Math.abs(values.dy) > 1e-9)
-              t.yExpression = `${(t.y ?? 0) / values.dy}*(${expressions.dy})`;
+          if (
+            operation === "rectangularArray" &&
+            (expressions.dx || expressions.dy)
+          ) {
+            const u = normalize({ x: values.ux ?? 1, y: values.uy ?? 0 });
+            const x = t.x ?? 0,
+              y = t.y ?? 0;
+            const along = x * u.x + y * u.y;
+            const across = -x * u.y + y * u.x;
+            const first =
+              expressions.dx && Math.abs(values.dx) > 1e-9
+                ? `${along / values.dx}*(${expressions.dx})`
+                : String(along);
+            const second =
+              expressions.dy && Math.abs(values.dy) > 1e-9
+                ? `${across / values.dy}*(${expressions.dy})`
+                : String(across);
+            t.xExpression = `${u.x}*(${first})-(${u.y})*(${second})`;
+            t.yExpression = `${u.y}*(${first})+${u.x}*(${second})`;
           }
           if (
             operation === "circularArray" &&
@@ -1269,7 +1412,7 @@ export default function App() {
           confirm: () => {
             const ok = commit(next, operationNames[operation]);
             if (ok) {
-              setPickOperation(undefined);
+              setCommand(null);
               setSelection([]);
             }
             return ok;
@@ -1280,7 +1423,7 @@ export default function App() {
       const ok = commit(next, operationNames[operation]);
       if (ok) {
         setSelection([]);
-        setPickOperation(undefined);
+        setCommand(null);
       }
       return ok;
     } catch (error) {
@@ -1289,47 +1432,8 @@ export default function App() {
     }
   };
   const startOperation = (op: string) => {
-    setMenu(null);
-    setDrafts([]);
-    setTool("select");
-    setDimensionMode(false);
-    setDimensionDraft(null);
-    setDimensionAdjustmentId(null);
-    setDimensionPicks([]);
-    if (["trim", "extend", "break"].includes(op)) {
-      setPickOperation(op);
-      return;
-    }
-    if (!selection.length) {
-      notify("请先选择对象", true);
-      return;
-    }
-    if (op === "detach" || op === "mirror") {
-      runOperation(op, {});
-      return;
-    }
-    if (op === "blend") {
-      if (selection.length !== 2 || selection.some((s) => s.pointId)) {
-        notify("过渡曲线需要选择两个对象", true);
-        return;
-      }
-      try {
-        const [a, b] = selection.map(
-          (sel) => sketch.entities.find((e) => e.id === sel.entityId)!,
-        );
-        if (a.sourceId || b.sourceId) throw new Error("请先解除关联");
-        const blended = blendEntity(a, b);
-        blended.id = uid();
-        blended.sourceId = a.id;
-        blended.transform = { kind: "blend", secondarySourceId: b.id };
-        transaction("过渡曲线", (_, s) => {
-          s.entities.push(blended);
-        });
-      } catch (error) {
-        notify((error as Error).message, true);
-      }
-      return;
-    }
+    const previous = command?.previousSelection ?? selection;
+    setMode("select");
     const forms: Record<string, Field[]> = {
       fillet: [field("radius", "半径", 5)],
       chamfer: [
@@ -1350,10 +1454,31 @@ export default function App() {
         field("cy", "基点 Y", 0),
       ],
       rectangularArray: [
-        field("cols", "列数", 3, ""),
-        field("rows", "行数", 2, ""),
-        field("dx", "X 间距", 20),
-        field("dy", "Y 间距", 20),
+        {
+          key: "distribution",
+          label: "分发",
+          value: "间距",
+          type: "select",
+          options: ["间距", "范围"],
+        },
+        field("cols", "数量 1", 3, ""),
+        field("dx", "距离 1", 20),
+        {
+          key: "direction1",
+          label: "方向 1",
+          value: "单向",
+          type: "select",
+          options: ["单向", "反向", "对称"],
+        },
+        field("rows", "数量 2", 2, ""),
+        field("dy", "距离 2", 20),
+        {
+          key: "direction2",
+          label: "方向 2",
+          value: "单向",
+          type: "select",
+          options: ["单向", "反向", "对称"],
+        },
       ],
       circularArray: [
         field("count", "数量", 6, ""),
@@ -1362,38 +1487,129 @@ export default function App() {
         field("cy", "中心 Y", 0),
       ],
     };
-    setModal({
-      title: operationNames[op],
-      fields: forms[op] ?? [],
-      confirm: (vs) => {
-        try {
-          const values: Record<string, number> = {};
-          const vars = resolveParameters(docRef.current.parameters);
-          for (const f of forms[op] ?? [])
-            values[f.key] =
-              evaluateExpression(
-                vs[f.key],
-                vars,
-                f.unit === "°" ? "deg" : f.unit ? "mm" : "scalar",
-              ) *
-              (f.unit === unit && !hasParameterReferences(vs[f.key])
-                ? factor
-                : 1);
-          return runOperation(
-            op,
-            values,
-            undefined,
-            undefined,
-            Object.fromEntries(
-              Object.entries(vs).filter(([, v]) => hasParameterReferences(v)),
-            ),
+    setCommand(
+      createCommandSession(
+        "operation",
+        op,
+        operationNames[op],
+        operationGeometry(op),
+        forms[op] ?? [],
+        sketch,
+        previous,
+      ),
+    );
+  };
+  const confirmCommand = () => {
+    if (!command || commandError) return;
+    const picked = commandSelections(command);
+    if (command.type === "constraint") {
+      const kind = command.name as ConstraintKind;
+      const targetRefs = picked.map(selectionKey);
+      const ok = transaction(constraintLabels[kind], (_, s) => {
+        if (canConstrain(s, kind, targetRefs))
+          throw new Error("选取的对象不适用于此约束");
+        if (
+          s.constraints.some(
+            (c) =>
+              c.kind === kind &&
+              c.refs.length === targetRefs.length &&
+              c.refs.every((r) => targetRefs.includes(r)),
+          )
+        )
+          throw new Error("此约束已经存在");
+        s.constraints.push({ id: uid("c"), kind, refs: targetRefs });
+      });
+      if (ok) {
+        setCommand(null);
+        setSelection(picked);
+      }
+      return;
+    }
+    if (command.name === "blend") {
+      const ok = transaction("过渡曲线", (_, s) => {
+        const [a, b] = picked.map(
+          (sel) => s.entities.find((e) => e.id === sel.entityId)!,
+        );
+        if (!a || !b || a.sourceId || b.sourceId)
+          throw new Error("请先解除关联");
+        const blended = blendEntity(a, b);
+        blended.id = uid();
+        blended.sourceId = a.id;
+        blended.transform = { kind: "blend", secondarySourceId: b.id };
+        s.entities.push(blended);
+      });
+      if (ok) {
+        setCommand(null);
+        setSelection([]);
+      }
+      return;
+    }
+    try {
+      const values: Record<string, number> = {};
+      const vars = resolveParameters(docRef.current.parameters);
+      for (const f of command.fields) {
+        if (f.type === "select") continue;
+        values[f.key] =
+          evaluateExpression(
+            command.values[f.key],
+            vars,
+            f.unit === "°" ? "deg" : f.unit ? "mm" : "scalar",
+          ) *
+          (f.unit === unit && !hasParameterReferences(command.values[f.key])
+            ? factor
+            : 1);
+      }
+      if (command.name === "rectangularArray") {
+        const directionId = command.geometry.find((p) => p.key === "direction")
+          ?.selections[0]?.entityId;
+        const direction = sketch.entities.find((e) => e.id === directionId);
+        if (direction) {
+          const vector = normalize(
+            sub(direction.points[1], direction.points[0]),
           );
-        } catch (error) {
-          notify((error as Error).message, true);
-          return false;
+          values.ux = vector.x;
+          values.uy = vector.y;
         }
-      },
-    });
+        values.range = command.values.distribution === "范围" ? 1 : 0;
+        values.direction1 =
+          command.values.direction1 === "反向"
+            ? -1
+            : command.values.direction1 === "对称"
+              ? 0
+              : 1;
+        values.direction2 =
+          command.values.direction2 === "反向"
+            ? -1
+            : command.values.direction2 === "对称"
+              ? 0
+              : 1;
+      }
+      const position = command.geometry.find(
+        (p) => p.kind === "position",
+      )?.position;
+      if (
+        position &&
+        ["rotate", "scale", "circularArray"].includes(command.name)
+      ) {
+        values.cx = position.x;
+        values.cy = position.y;
+      }
+      const ids =
+        command.name === "mirror"
+          ? picked.map((s) => s.entityId)
+          : command.geometry
+              .find((p) => p.key === "objects")!
+              .selections.map((s) => s.entityId);
+      const expressions = Object.fromEntries(
+        command.fields
+          .filter((f) => f.type !== "select")
+          .map((f) => [f.key, command.values[f.key]])
+          .filter(([, v]) => hasParameterReferences(v)),
+      );
+      runOperation(command.name, values, ids, position, expressions);
+    } catch (error) {
+      notify((error as Error).message, true);
+    }
   };
   const openExport = () => {
     setMenu(null);
@@ -1525,10 +1741,8 @@ export default function App() {
         const next = demo ? demoDocument() : emptyDocument();
         next.name = values.name.trim() || "未命名草图";
         if (commit(next, "新建")) {
-          setActiveId(next.sketches[0].id);
-          setSelection([]);
+          switchSketch(next.sketches[0].id);
           setFitKey((v) => v + 1);
-          cancel();
           return true;
         }
         return false;
@@ -1536,19 +1750,15 @@ export default function App() {
     });
   };
   const createSketch = () => {
-    transaction("新建草图", (candidate) => {
-      const s: Sketch = {
-        id: uid("sk"),
-        name: `草图 ${candidate.sketches.length + 1}`,
-        visible: true,
-        entities: [],
-        constraints: [],
-      };
-      candidate.sketches.push(s);
-      setActiveId(s.id);
-    });
-    setSelection([]);
-    cancel();
+    const s: Sketch = {
+      id: uid("sk"),
+      name: `草图 ${docRef.current.sketches.length + 1}`,
+      visible: true,
+      entities: [],
+      constraints: [],
+    };
+    if (transaction("新建草图", (candidate) => candidate.sketches.push(s)))
+      switchSketch(s.id);
   };
   const editEntity = (e: Entity) => {
     if (e.sourceId && e.transform) {
@@ -1652,6 +1862,13 @@ export default function App() {
               )
             )
               throw new Error("固定对象须先移除固定约束");
+            if (
+              key === "ry" &&
+              s.constraints.some(
+                (c) => c.kind === "ellipseWidth" && c.refs[0] === item.id,
+              )
+            )
+              throw new Error("短轴已绑定，请编辑绑定点或移除短轴关联");
             if (
               key === "radius" &&
               s.constraints.some(
@@ -1885,7 +2102,7 @@ export default function App() {
       <div className="ribbon">
         <div className="ribbon-group select-group">
           <button
-            className={`ribbon-tool ${tool === "select" && !pickOperation ? "selected" : ""}`}
+            className={`ribbon-tool ${tool === "select" && !command ? "selected" : ""}`}
             onClick={() => setMode("select")}
             title="选择"
           >
@@ -1973,7 +2190,7 @@ export default function App() {
               return (
                 <button
                   key={op}
-                  className={`ribbon-tool ${pickOperation === op ? "selected" : ""}`}
+                  className={`ribbon-tool ${command?.type === "operation" && command.name === op ? "selected" : ""}`}
                   title={operationNames[op]}
                   onClick={() => startOperation(op)}
                 >
@@ -2041,12 +2258,8 @@ export default function App() {
                 key={kind}
                 icon={constraintIcons[kind]}
                 title={constraintLabels[kind]}
-                disabled={
-                  !ready ||
-                  !!canConstrain(sketch, kind, refs) ||
-                  selectedEntities.some((e) => e.sourceId)
-                }
-                onClick={() => addConstraint(kind)}
+                disabled={!ready}
+                onClick={() => startConstraint(kind)}
               />
             ))}
           </div>
@@ -2064,9 +2277,9 @@ export default function App() {
                   key={kind}
                   icon={constraintIcons[kind]}
                   label={constraintLabels[kind]}
-                  disabled={!!canConstrain(sketch, kind, refs)}
+                  disabled={!ready}
                   onClick={() => {
-                    addConstraint(kind);
+                    startConstraint(kind);
                     setMenu(null);
                   }}
                 />
@@ -2121,11 +2334,14 @@ export default function App() {
             <select
               aria-label="单位"
               value={doc.unit}
-              onChange={(e) =>
-                transaction("切换单位", (candidate) => {
-                  candidate.unit = e.target.value as "mm" | "in";
-                })
-              }
+              onChange={(e) => {
+                if (
+                  transaction("切换单位", (candidate) => {
+                    candidate.unit = e.target.value as "mm" | "in";
+                  })
+                )
+                  setMode("select");
+              }}
             >
               <option value="mm">毫米</option>
               <option value="in">英寸</option>
@@ -2149,11 +2365,7 @@ export default function App() {
               >
                 <button
                   className="sketch-name"
-                  onClick={() => {
-                    setActiveId(s.id);
-                    setSelection([]);
-                    cancel();
-                  }}
+                  onClick={() => switchSketch(s.id)}
                 >
                   <ChevronRight size={12} />
                   <Pencil size={14} />
@@ -2201,7 +2413,7 @@ export default function App() {
               return (
                 <button
                   key={e.id}
-                  className={`entity-row ${selection.some((s) => s.entityId === e.id) ? "selected" : ""}`}
+                  className={`entity-row ${displayedSelection.some((s) => s.entityId === e.id) ? "selected" : ""}`}
                   title={e.sourceId ? "关联副本" : e.name}
                   onClick={(event) =>
                     select(
@@ -2209,7 +2421,9 @@ export default function App() {
                       event.ctrlKey || event.metaKey || event.shiftKey,
                     )
                   }
-                  onDoubleClick={() => editEntity(e)}
+                  onDoubleClick={() => {
+                    if (!command) editEntity(e);
+                  }}
                 >
                   <Icon size={14} />
                   <span>{e.name}</span>
@@ -2233,7 +2447,7 @@ export default function App() {
           <Viewport
             sketches={doc.sketches}
             activeId={activeId}
-            selection={selection}
+            selection={displayedSelection}
             tool={tool}
             drafts={drafts}
             config={config}
@@ -2244,14 +2458,22 @@ export default function App() {
             unit={doc.unit}
             onPlace={place}
             onSelect={select}
-            onBox={(ids, additive) =>
+            onBox={(ids, additive) => {
+              if (command) {
+                changeCommandSelection(
+                  ids.map((entityId) => ({ entityId })),
+                  additive ? "append" : "replace",
+                );
+                return;
+              }
+              if (!additive) setSelectedDimensionId(null);
               setSelection((prev) => {
                 const next = ids.map((entityId) => ({ entityId }));
                 return additive
                   ? [...prev.filter((p) => !ids.includes(p.entityId)), ...next]
                   : next;
-              })
-            }
+              });
+            }}
             onCursor={setCursor}
             onDrag={drag}
             onFinish={(point, snapRef) => {
@@ -2266,10 +2488,14 @@ export default function App() {
               const c = sketch.constraints.find((c) => c.id === id);
               if (c) openDimensionInput(c.kind, c.refs, { existingId: c.id });
             }}
-            pickOperation={pickOperation}
-            onPickOperation={(entityId, p) =>
-              runOperation(pickOperation!, {}, p, entityId)
+            pickParameters={
+              command
+                ? command.geometry[command.active]?.kind === "position"
+                  ? "position"
+                  : "geometry"
+                : undefined
             }
+            onParameterPick={pickCommand}
             pickDimension={dimensionMode}
             dimensionPicks={dimensionPicks}
             dimensionKindMode={dimensionKindMode}
@@ -2285,10 +2511,24 @@ export default function App() {
             dimensionAdjustment={dimensionAdjustment}
             onDimensionAdjust={adjustDimension}
             onDimensionPositionCommit={commitDimensionPosition}
+            dimensionSelection={selectedDimensionId}
+            onDimensionSelect={selectDimension}
             onDimensionPick={pickDimension}
             onDimensionCommit={commitDimension}
             onDimensionCancel={cancelDimensions}
           />
+          {command && (
+            <ParameterPanel
+              session={command}
+              sketch={sketch}
+              unit={unit}
+              factor={factor}
+              error={commandError}
+              onChange={setCommand}
+              onConfirm={confirmCommand}
+              onCancel={cancel}
+            />
+          )}
           {!ready && (
             <div className="loading-overlay">
               <LoaderCircle size={23} className="spin" />
@@ -2444,6 +2684,48 @@ export default function App() {
                   />
                 </div>
               </>
+            ) : selectedDimension ? (
+              <div data-testid="selected-dimension">
+                <div className="property-title">
+                  标注
+                  <span className="property-chip">
+                    {constraintLabels[selectedDimension.kind]}
+                  </span>
+                </div>
+                {selectedDimension.value !== undefined && (
+                  <div className="property-row">
+                    <span>数值</span>
+                    <strong>
+                      {selectedDimension.expression ??
+                        (selectedDimension.kind === "angle"
+                          ? `${Number(selectedDimension.value.toFixed(2))}°`
+                          : formatted(selectedDimension.value))}
+                    </strong>
+                  </div>
+                )}
+                <div className="selection-actions">
+                  {selectedDimension.value !== undefined && (
+                    <button
+                      className="button small"
+                      onClick={() =>
+                        openDimensionInput(
+                          selectedDimension.kind,
+                          selectedDimension.refs,
+                          { existingId: selectedDimension.id },
+                        )
+                      }
+                    >
+                      <Ruler size={14} />
+                      编辑
+                    </button>
+                  )}
+                  <IconButton
+                    icon={Trash2}
+                    title="删除选中对象"
+                    onClick={removeSelected}
+                  />
+                </div>
+              </div>
             ) : (
               <div className="empty-selection">
                 <MousePointer2 size={21} />
@@ -2461,12 +2743,8 @@ export default function App() {
                 key={kind}
                 icon={constraintIcons[kind]}
                 title={constraintLabels[kind]}
-                disabled={
-                  !ready ||
-                  !!canConstrain(sketch, kind, refs) ||
-                  selectedEntities.some((e) => e.sourceId)
-                }
-                onClick={() => addConstraint(kind)}
+                disabled={!ready}
+                onClick={() => startConstraint(kind)}
               />
             ))}
           </div>
@@ -2595,11 +2873,7 @@ export default function App() {
             <button
               key={s.id}
               className={s.id === activeId ? "active" : ""}
-              onClick={() => {
-                setActiveId(s.id);
-                setSelection([]);
-                cancel();
-              }}
+              onClick={() => switchSketch(s.id)}
             >
               <Pencil size={12} />
               {s.name}
@@ -2673,8 +2947,8 @@ export default function App() {
                         ? "尺寸：请选择直线或点"
                         : "尺寸：请选择第二个点"
                     : "尺寸：点击几何或点"
-                : pickOperation
-                  ? operationNames[pickOperation]
+                : command
+                  ? `${command.title}：选择${command.geometry[command.active]?.label}`
                   : toolLabels[tool]}
           {drafts.length ? ` · ${drafts.length}` : ""}
         </span>
@@ -2710,10 +2984,8 @@ export default function App() {
             if (file.size > 10_000_000) throw new Error("文件超过 10 MB");
             const next = validateDocument(JSON.parse(await file.text()));
             if (commit(next, "打开草图")) {
-              setActiveId(next.sketches[0].id);
-              setSelection([]);
+              switchSketch(next.sketches[0].id);
               setFitKey((v) => v + 1);
-              cancel();
               notify("草图已打开");
             }
           } catch (error) {

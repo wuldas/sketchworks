@@ -1,6 +1,7 @@
 import paper from "paper";
 import {
   type Entity,
+  type AngleSector,
   type XY,
   type Sketch,
   type Transform,
@@ -57,17 +58,87 @@ export function pointLineDistance(p: XY, a: XY, b: XY) {
     length = Math.hypot(d.x, d.y);
   return length ? Math.abs(cross(d, sub(p, a))) / length : 0;
 }
-export function angleDimensionFrame(a: Entity, b?: Entity) {
+const tau = Math.PI * 2;
+const positiveAngle = (angle: number) => {
+  const result = ((angle % tau) + tau) % tau;
+  return result < 1e-10 || tau - result < 1e-10 ? 0 : result;
+};
+function sharedAngleVertex(a: Entity, b: Entity) {
+  for (let i = 0; i < 2; i++)
+    for (let j = 0; j < 2; j++)
+      if (dist(a.points[i], b.points[j]) <= EPS)
+        return {
+          vertex: lerp(a.points[i], b.points[j], 0.5),
+          first: i,
+          second: j,
+        };
+}
+export function angleDimensionFrame(
+  a: Entity,
+  b?: Entity,
+  sector?: AngleSector,
+) {
   const v = sub(a.points[1], a.points[0]);
   if (!b) return { vertex: a.points[0], start: 0, sweep: Math.atan2(v.y, v.x) };
-  const w = sub(b.points[1], b.points[0]);
+  const w = sub(b.points[1], b.points[0]),
+    first = sector?.reverseFirst ? mul(v, -1) : v,
+    second = sector?.reverseSecond ? mul(w, -1) : w,
+    start = Math.atan2(first.y, first.x),
+    signed = Math.atan2(cross(first, second), dot(first, second));
   return {
     vertex:
+      sharedAngleVertex(a, b)?.vertex ??
       lineIntersection(a.points[0], a.points[1], b.points[0], b.points[1]) ??
       a.points[0],
-    start: Math.atan2(v.y, v.x),
-    sweep: Math.atan2(cross(v, w), dot(v, w)),
+    start,
+    sweep: sector
+      ? sector.clockwise
+        ? -positiveAngle(-signed)
+        : positiveAngle(signed)
+      : signed,
   };
+}
+
+/** Select the wedge under the cursor; connected corners default to rays away from their joint. */
+export function selectAngleSector(
+  a: Entity,
+  b: Entity,
+  position?: XY,
+): AngleSector {
+  const joint = sharedAngleVertex(a, b),
+    preferred = {
+      reverseFirst: joint?.first === 1,
+      reverseSecond: joint?.second === 1,
+    },
+    directed = (reverseFirst: boolean, reverseSecond: boolean): AngleSector => {
+      const v = mul(sub(a.points[1], a.points[0]), reverseFirst ? -1 : 1),
+        w = mul(sub(b.points[1], b.points[0]), reverseSecond ? -1 : 1);
+      let clockwise = cross(v, w) < 0;
+      if (position && Math.abs(cross(v, w)) <= EPS && dot(v, w) < 0) {
+        const vertex = joint?.vertex ?? angleDimensionFrame(a, b).vertex;
+        clockwise = cross(v, sub(position, vertex)) < 0;
+      }
+      return { reverseFirst, reverseSecond, clockwise };
+    };
+  const fallback = directed(preferred.reverseFirst, preferred.reverseSecond),
+    vertex = angleDimensionFrame(a, b, fallback).vertex;
+  if (!position || dist(vertex, position) <= EPS) return fallback;
+  const angle = Math.atan2(position.y - vertex.y, position.x - vertex.x),
+    choices = [
+      fallback,
+      ...[false, true].flatMap((first) =>
+        [false, true].map((second) => directed(first, second)),
+      ),
+    ];
+  for (const sector of choices) {
+    const frame = angleDimensionFrame(a, b, sector),
+      travel = positiveAngle(
+        sector.clockwise ? frame.start - angle : angle - frame.start,
+      );
+    if (travel <= Math.abs(frame.sweep) + 1e-9 || tau - travel <= 1e-9)
+      return sector;
+  }
+  return fallback;
 }
 export function projection(p: XY, a: XY, b: XY, clamp = true) {
   const ab = sub(b, a),

@@ -1077,6 +1077,11 @@ try {
         .filter({ hasNotText: derivedBase.id })
         .click();
       await button(session.page, "\u89e3\u9664\u5173\u8054").click();
+      // 解除关联 now confirms through the shared command parameter panel.
+      const detachPanel = session.page.getByTestId("parameter-panel");
+      await detachPanel.waitFor();
+      await detachPanel.locator('button[type="submit"]').click();
+      await detachPanel.waitFor({ state: "detached" });
       const detached = await saved(session);
       assert.equal(byId(detached, derived.id).sourceId, undefined);
       assert.equal(

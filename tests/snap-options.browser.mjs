@@ -827,6 +827,185 @@ try {
     },
   );
 
+  for (const sample of [
+    {
+      name: "endpoint",
+      doc: fixture([sourceA]),
+      target: sourceA.points[0],
+      options: ["endpoint"],
+      kind: "coincident",
+      source: sourceA.points[0].id,
+    },
+    {
+      name: "midpoint",
+      doc: fixture([midSource]),
+      target: midpoint,
+      options: ["midpoint"],
+      kind: "midpoint",
+      source: midSource.id,
+    },
+    {
+      name: "center",
+      doc: fixture([
+        entity("circle", "center-source", [[21, -13]], { radius: 6 }),
+      ]),
+      target: { x: 21, y: -13 },
+      options: [],
+      kind: "coincident",
+      source: "center-source_p0",
+    },
+    {
+      name: "intersection",
+      doc: fixture([crossA, crossB]),
+      target: crossing,
+      options: ["intersection"],
+      kind: "intersection",
+      source: crossA.id,
+    },
+    {
+      name: "origin",
+      doc: fixture(),
+      target: { x: 0, y: 0 },
+      options: [],
+      kind: "origin",
+    },
+  ]) {
+    await check(
+      `Automatic binding persists for ${sample.name}`,
+      sample.doc,
+      async (session) => {
+        await only(session, sample.options);
+        await option(session, names.auto, true);
+        const drawn = await drawPoint(session, sample.target, 4, 1);
+        assertSnap(
+          drawn.moved,
+          sample.name === "center" ? "point" : sample.name,
+        );
+        near(drawn.entity.points[0], sample.target);
+        const binding = sketch(drawn.doc).constraints.find(
+          (item) =>
+            item.kind === sample.kind &&
+            item.refs.includes(drawn.entity.points[0].id),
+        );
+        assert(binding, `${sample.name} creates a persisted binding`);
+        if (sample.source) assert(binding.refs.includes(sample.source));
+        const restored = await open(drawn.doc);
+        try {
+          const doc = await saved(restored);
+          assert(
+            sketch(doc).constraints.some((item) => item.id === binding.id),
+            "binding survives save/load validation and solving",
+          );
+          near(
+            sketch(doc).entities.find((item) => item.id === drawn.entity.id)
+              .points[0],
+            sample.target,
+          );
+        } finally {
+          await restored.context.close();
+        }
+        return { binding, point: drawn.entity.points[0] };
+      },
+    );
+  }
+
+  await check(
+    "Automatic binding keeps a tangent endpoint on its circle",
+    fixture([circle, anchorPoint]),
+    async (session) => {
+      await only(session, ["tangent"]);
+      await option(session, names.auto, true);
+      const drawn = await drawLine(session, anchor, tangent);
+      assertSnap(drawn.last, "tangent");
+      near(drawn.entity.points[0], anchor);
+      near(drawn.entity.points[1], tangent);
+      const constraints = sketch(drawn.doc).constraints;
+      assert(
+        constraints.some(
+          (item) =>
+            item.kind === "tangent" &&
+            item.refs.includes(drawn.entity.id) &&
+            item.refs.includes(circle.id),
+        ),
+      );
+      assert(
+        constraints.some(
+          (item) =>
+            item.kind === "onCurve" &&
+            item.refs.includes(drawn.entity.points[1].id) &&
+            item.refs.includes(circle.id),
+        ),
+      );
+      await screenshot(session, "automatic-tangent-binding.png");
+      return {
+        points: drawn.entity.points,
+        constraints: constraints.filter((item) =>
+          item.refs.includes(circle.id),
+        ),
+      };
+    },
+  );
+
+  const movableMidpointDoc = fixture([midSource]);
+  movableMidpointDoc.sketches[0].constraints =
+    movableMidpointDoc.sketches[0].constraints.filter(
+      (item) => !item.refs.includes(midSource.id),
+    );
+  await check(
+    "Automatic binding follows source midpoint dragging and supports undo redo",
+    movableMidpointDoc,
+    async (session) => {
+      await only(session, ["midpoint"]);
+      await option(session, names.auto, true);
+      const drawn = await drawLine(session, midpoint, { x: 28, y: -21 });
+      await master(session, false);
+      const from = await screen(session, midSource.points[0]),
+        to = await screen(session, { x: -33, y: 27 });
+      await session.page.mouse.move(from.x, from.y);
+      await session.page.mouse.down();
+      await session.page.mouse.move(to.x, to.y, { steps: 10 });
+      await session.page.mouse.up();
+      await settle(session);
+      const moved = await saved(session);
+      const source = sketch(moved).entities.find(
+          (item) => item.id === midSource.id,
+        ),
+        attached = sketch(moved).entities.find(
+          (item) => item.id === drawn.entity.id,
+        );
+      const expected = {
+        x: (source.points[0].x + source.points[1].x) / 2,
+        y: (source.points[0].y + source.points[1].y) / 2,
+      };
+      near(attached.points[0], expected);
+      assert(
+        Math.hypot(
+          attached.points[0].x - midpoint.x,
+          attached.points[0].y - midpoint.y,
+        ) > 1,
+        "binding moves with source instead of retaining captured XY",
+      );
+      await session.page.keyboard.press("Control+z");
+      await settle(session);
+      const undone = await saved(session);
+      near(
+        sketch(undone).entities.find((item) => item.id === drawn.entity.id)
+          .points[0],
+        midpoint,
+      );
+      await session.page.keyboard.press("Control+Shift+z");
+      await settle(session);
+      const redone = await saved(session);
+      near(
+        sketch(redone).entities.find((item) => item.id === drawn.entity.id)
+          .points[0],
+        expected,
+      );
+      await screenshot(session, "automatic-midpoint-follow.png");
+      return { expected, actual: attached.points[0] };
+    },
+  );
+
   const preciseStart = { x: -1000, y: 20 };
   const lengthSquared = preciseStart.x ** 2 + preciseStart.y ** 2;
   const tangentOffset = (10 * Math.sqrt(lengthSquared - 100)) / lengthSquared;
@@ -981,7 +1160,7 @@ try {
   );
 
   await check(
-    "Circle and Bezier curve intersections use actual path coordinates",
+    "Circle and Bezier intersections commit exact native circle coordinates",
     fixture([
       entity("circle", "curve-circle", [[12, 9]], { radius: 10 }),
       entity("bezier", "crossing-curve", [
@@ -1011,7 +1190,16 @@ try {
       assert.equal((await session.metadata()).snap, null);
       await capture(session, "intersection", true, true);
       const drawn = await drawPoint(session, target, 2, 1);
-      near(drawn.entity.points[0], actual);
+      near(drawn.entity.points[0], target);
+      assert(
+        Math.abs(
+          Math.hypot(
+            drawn.entity.points[0].x - 12,
+            drawn.entity.points[0].y - 9,
+          ) - 10,
+        ) <= 1e-7,
+        "the persistent intersection must satisfy the exact circle radius",
+      );
       assert.equal(
         sketch(drawn.doc).constraints.filter(
           (item) => item.kind === "coincident",

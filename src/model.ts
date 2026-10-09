@@ -38,6 +38,7 @@ export interface Entity {
   fontSize?: number;
   rotation?: number;
   construction?: boolean;
+  ownerId?: string;
   sourceId?: string;
   transform?: Transform;
 }
@@ -50,6 +51,9 @@ export type ConstraintKind =
   | "equal"
   | "fixed"
   | "onLine"
+  | "onCurve"
+  | "intersection"
+  | "origin"
   | "tangent"
   | "concentric"
   | "midpoint"
@@ -60,16 +64,26 @@ export type ConstraintKind =
   | "distanceX"
   | "distanceY"
   | "radius"
+  | "ellipseWidth"
   | "diameter"
   | "angle";
+export interface AngleSector {
+  reverseFirst: boolean;
+  reverseSecond: boolean;
+  clockwise: boolean;
+}
 export interface Constraint {
   id: string;
   kind: ConstraintKind;
   refs: string[];
   value?: number;
   expression?: string;
+  angleSector?: AngleSector;
   labelPosition?: XY;
+  labelOffset?: XY;
   anchors?: Point[];
+  /** The onLine point must lie on the positive ray from line.points[0] to line.points[1]. */
+  sameRay?: boolean;
 }
 export interface Sketch {
   id: string;
@@ -128,6 +142,9 @@ export const constraintLabels: Record<ConstraintKind, string> = {
   equal: "相等",
   fixed: "固定",
   onLine: "点在线上",
+  onCurve: "点在曲线上",
+  intersection: "交点重合",
+  origin: "原点重合",
   tangent: "相切",
   concentric: "同心",
   midpoint: "中点",
@@ -138,6 +155,7 @@ export const constraintLabels: Record<ConstraintKind, string> = {
   distanceX: "水平距离",
   distanceY: "垂直距离",
   radius: "半径",
+  ellipseWidth: "短轴关联",
   diameter: "直径",
   angle: "角度",
 };
@@ -178,7 +196,8 @@ export function deleteEntities(sketch: Sketch, ids: string[]) {
     changed = false;
     for (const e of sketch.entities)
       if (
-        ((e.sourceId && all.has(e.sourceId)) ||
+        ((e.ownerId && all.has(e.ownerId)) ||
+          (e.sourceId && all.has(e.sourceId)) ||
           (e.transform?.axisId && all.has(e.transform.axisId)) ||
           (e.transform?.secondarySourceId &&
             all.has(e.transform.secondarySourceId))) &&
@@ -286,6 +305,16 @@ export function validateDocument(raw: unknown): Document {
     }
     for (const e of sk.entities) {
       if (
+        e.ownerId !== undefined &&
+        (typeof e.ownerId !== "string" ||
+          e.ownerId === e.id ||
+          !sk.entities.some(
+            (owner) =>
+              owner.id === e.ownerId && !owner.ownerId && !owner.sourceId,
+          ))
+      )
+        throw new Error("辅助几何所属对象无效");
+      if (
         e.sourceId &&
         (!sk.entities.some((s) => s.id === e.sourceId && !s.sourceId) ||
           !e.transform)
@@ -344,6 +373,97 @@ export function validateDocument(raw: unknown): Document {
       )
         throw new Error("约束或引用无效");
       if (
+        c.angleSector !== undefined &&
+        (c.kind !== "angle" ||
+          c.refs.length !== 2 ||
+          !c.angleSector ||
+          typeof c.angleSector.reverseFirst !== "boolean" ||
+          typeof c.angleSector.reverseSecond !== "boolean" ||
+          typeof c.angleSector.clockwise !== "boolean" ||
+          !c.refs.every((ref) =>
+            sk.entities.some(
+              (e) => e.id === ref && e.kind === "line" && !e.sourceId,
+            ),
+          ))
+      )
+        throw new Error("角度方向或射线引用无效");
+      if (c.sameRay !== undefined) {
+        const pointOwner = (ref: string) =>
+          sk.entities.find(
+            (e) =>
+              !e.sourceId &&
+              (e.points.some((p) => p.id === ref) ||
+                (e.kind === "point" && e.id === ref)),
+          );
+        if (
+          typeof c.sameRay !== "boolean" ||
+          c.kind !== "onLine" ||
+          c.refs.length !== 2 ||
+          new Set(c.refs).size !== 2 ||
+          !c.refs.some(
+            (ref, i) =>
+              !!pointOwner(ref) &&
+              sk.entities.some(
+                (e) =>
+                  e.id === c.refs[1 - i] && e.kind === "line" && !e.sourceId,
+              ),
+          )
+        )
+          throw new Error("径向方向绑定或射线引用无效");
+      }
+      if (c.kind === "ellipseWidth") {
+        const targets = c.refs.map((id) =>
+          sk.entities.find((e) => e.id === id && !e.sourceId),
+        );
+        if (
+          c.refs.length !== 2 ||
+          targets[0]?.kind !== "ellipse" ||
+          targets[1]?.kind !== "circle"
+        )
+          throw new Error("尺寸关联引用无效");
+      }
+      if (["origin", "onCurve", "intersection", "midpoint"].includes(c.kind)) {
+        const pointOwner = (ref: string) =>
+          sk.entities.find(
+            (e) =>
+              e.points.some((p) => p.id === ref) ||
+              (e.kind === "point" && e.id === ref),
+          );
+        const curve = (ref: string) =>
+          sk.entities.find(
+            (e) =>
+              e.id === ref &&
+              e.kind !== "point" &&
+              e.kind !== "text" &&
+              !e.sourceId,
+          );
+        const valid =
+          new Set(c.refs).size === c.refs.length &&
+          (c.kind === "origin"
+            ? c.refs.length === 1 &&
+              !!pointOwner(c.refs[0]) &&
+              !pointOwner(c.refs[0])?.sourceId
+            : c.kind === "onCurve" || c.kind === "midpoint"
+              ? c.refs.length === 2 &&
+                c.refs.some((ref, i) => {
+                  const source = curve(c.refs[1 - i]);
+                  return (
+                    !!pointOwner(ref) &&
+                    !pointOwner(ref)?.sourceId &&
+                    !!source &&
+                    (c.kind !== "midpoint" ||
+                      ["line", "arc", "spline", "bezier", "conic"].includes(
+                        source.kind,
+                      ))
+                  );
+                })
+              : c.refs.length === 3 &&
+                !!pointOwner(c.refs[0]) &&
+                !pointOwner(c.refs[0])?.sourceId &&
+                c.refs.slice(1).every((ref) => !!curve(ref)));
+        if (!valid) throw new Error("绑定约束引用无效");
+      }
+      if (
         c.labelPosition !== undefined &&
         (!c.labelPosition ||
           ![c.labelPosition.x, c.labelPosition.y].every(
@@ -352,6 +472,15 @@ export function validateDocument(raw: unknown): Document {
           ))
       )
         throw new Error("尺寸标注位置无效");
+      if (
+        c.labelOffset !== undefined &&
+        (!c.labelOffset ||
+          ![c.labelOffset.x, c.labelOffset.y].every(
+            (v) =>
+              typeof v === "number" && Number.isFinite(v) && Math.abs(v) <= 3e7,
+          ))
+      )
+        throw new Error("尺寸标注相对偏移无效");
       if (
         c.anchors !== undefined &&
         (!Array.isArray(c.anchors) ||

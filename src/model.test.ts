@@ -205,6 +205,7 @@ describe("associated document validation and deletion", () => {
       refs: [a.id],
       value: 4,
       labelPosition: { x: 2, y: 8 },
+      labelOffset: { x: 0, y: 8 },
     });
     const validated = validateDocument(d);
     expect(validated.sketches[0].constraints[0].labelPosition).toEqual({
@@ -213,6 +214,12 @@ describe("associated document validation and deletion", () => {
     });
     validated.sketches[0].constraints[0].labelPosition!.x = 10;
     expect(s.constraints[0].labelPosition!.x).toBe(2);
+    expect(validated.sketches[0].constraints[0].labelOffset).toEqual({
+      x: 0,
+      y: 8,
+    });
+    validated.sketches[0].constraints[0].labelOffset!.x = 10;
+    expect(s.constraints[0].labelOffset!.x).toBe(0);
   });
   it("rejects malformed dimension label positions", () => {
     for (const labelPosition of [

@@ -12,12 +12,14 @@ import {
   type Entity,
   type Sketch,
   clone,
+  deleteEntities,
   emptyDocument,
   entity,
   uid,
   validateDocument,
 } from "./model";
 import { modifySketch } from "./operations";
+import { updateDimensionLabels } from "./dimensionLabel";
 
 const line = (ax: number, ay: number, bx: number, by: number) =>
   entity("line", [
@@ -146,6 +148,50 @@ describe("sketch transformations", () => {
     ]);
     valid(s);
   });
+  it("does not copy an absolute origin binding into a translated copy", () => {
+    const a = line(0, 0, 20, 8),
+      s = sketch(a);
+    s.constraints.push({
+      id: "origin",
+      kind: "origin",
+      refs: [a.points[0].id],
+    });
+    modifySketch(s, [a.id], "copy", { dx: 50, dy: 10 });
+    expect(s.constraints).toHaveLength(1);
+    expect(s.entities[1].points[0]).toMatchObject({ x: 50, y: 10 });
+    expect(s.entities[1].points[1]).toMatchObject({ x: 70, y: 18 });
+    expect(() => modifySketch(s, [a.id], "move", { dx: 10 })).toThrow("固定");
+    valid(s);
+  });
+  it("remaps copied auxiliary ownership and releases independent helper copies", () => {
+    const circle = entity("circle", [{ x: 0, y: 0 }], { radius: 10 }),
+      helper = entity("point", [{ x: 10, y: 0 }], {
+        construction: true,
+        ownerId: circle.id,
+      }),
+      s = sketch(circle, helper);
+    s.constraints.push({
+      id: "onCurve",
+      kind: "onCurve",
+      refs: [helper.points[0].id, circle.id],
+    });
+    modifySketch(s, [circle.id, helper.id], "copy", { dx: 30 });
+    const copiedCircle = s.entities[2],
+      copiedHelper = s.entities[3];
+    expect(copiedHelper.ownerId).toBe(copiedCircle.id);
+    modifySketch(s, [helper.id], "copy", { dx: 50 });
+    expect(s.entities[4].ownerId).toBeUndefined();
+    valid(s);
+    deleteEntities(s, [circle.id]);
+    expect(s.entities.some((e) => e.id === copiedHelper.id)).toBe(true);
+    expect(
+      s.constraints.some(
+        (c) =>
+          c.kind === "onCurve" && c.refs.includes(copiedHelper.points[0].id),
+      ),
+    ).toBe(true);
+    valid(s);
+  });
   it("copies placed dimensions with their geometry and preserves the original label", () => {
     const a = line(0, 0, 20, 0);
     const s = sketch(a);
@@ -156,6 +202,7 @@ describe("sketch transformations", () => {
       value: 20,
       labelPosition: { x: 10, y: 10 },
     });
+    updateDimensionLabels(s);
     const original = clone(s.constraints[0]);
     modifySketch(s, [a.id], "copy", { dx: 3, dy: 50 });
     expect(s.entities[1].points[0]).toMatchObject({ x: 3, y: 50 });

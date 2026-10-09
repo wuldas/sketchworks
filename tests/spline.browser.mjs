@@ -188,6 +188,9 @@ async function open(fixtureDoc, options = {}) {
     await page
       .getByRole("checkbox", { name: "\u7f51\u683c", exact: true })
       .setChecked(false);
+    const gridCapture = page.locator('button[title="网格捕获"]');
+    if ((await gridCapture.getAttribute("aria-pressed")) === "true")
+      await gridCapture.click();
     await settle(session);
     return session;
   } catch (error) {

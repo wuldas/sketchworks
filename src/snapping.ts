@@ -10,6 +10,12 @@ export type SnapKind =
   | "origin"
   | "grid";
 
+export type SnapBinding = {
+  kind: "midpoint" | "tangent" | "intersection" | "origin";
+  refs: string[];
+};
+export type SnapReference = string | SnapBinding;
+
 export interface SnapOptions {
   grid: boolean;
   midpoint: boolean;

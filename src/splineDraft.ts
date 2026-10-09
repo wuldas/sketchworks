@@ -1,11 +1,11 @@
 import { type XY } from "./model";
 import { dist } from "./geometry";
 
-export function appendSplinePoint(
+export function appendSplinePoint<Ref>(
   points: XY[],
-  refs: (string | undefined)[],
+  refs: (Ref | undefined)[],
   point: XY,
-  ref?: string,
+  ref?: Ref,
 ) {
   const last = points.at(-1);
   if (last && dist(last, point) <= 1e-7) {

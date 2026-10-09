@@ -1,6 +1,111 @@
 import { describe, expect, it } from "vitest";
 import { entity, emptyDocument } from "./model";
-import { dragAnchor, resolveDragSnap, sameDragPosition } from "./dragging";
+import {
+  dragAnchor,
+  resolveDragSelection,
+  resolveDragSnap,
+  sameDragPosition,
+} from "./dragging";
+
+const controlFixtures = [
+  entity("line", [
+    { x: 0, y: 0 },
+    { x: 10, y: 4 },
+  ]),
+  entity("circle", [{ x: 3, y: 7 }], { radius: 5 }),
+  entity(
+    "arc",
+    [
+      { x: 0, y: 0 },
+      { x: 5, y: 0 },
+      { x: 0, y: 5 },
+    ],
+    { radius: 5 },
+  ),
+  entity(
+    "ellipse",
+    [
+      { x: 0, y: 0 },
+      { x: 8, y: 0 },
+    ],
+    { ry: 4 },
+  ),
+  entity("spline", [
+    { x: 0, y: 0 },
+    { x: 4, y: 8 },
+    { x: 12, y: 3 },
+  ]),
+  entity("bezier", [
+    { x: 0, y: 0 },
+    { x: 3, y: 9 },
+    { x: 9, y: 3 },
+    { x: 12, y: 6 },
+  ]),
+  entity(
+    "conic",
+    [
+      { x: 0, y: 0 },
+      { x: 5, y: 9 },
+      { x: 12, y: 3 },
+    ],
+    { weight: 0.6 },
+  ),
+  entity("point", [{ x: 3, y: 7 }]),
+  entity("text", [{ x: 3, y: 7 }], { text: "ABC", fontSize: 4 }),
+];
+describe("whole-entity multiselection grips", () => {
+  it.each(controlFixtures)(
+    "treats every $kind handle as a group grip when whole entities are selected",
+    (primary) => {
+      const s = emptyDocument().sketches[0],
+        peer = entity("circle", [{ x: 30, y: 15 }], { radius: 5 });
+      s.entities.push(primary, peer);
+      const selected = s.entities.map((e) => ({ entityId: e.id }));
+      for (const point of primary.points) {
+        const hit = { entityId: primary.id, pointId: point.id },
+          body = resolveDragSelection(hit, selected);
+        expect(body).toEqual({ entityId: primary.id });
+        const anchor = dragAnchor(s, body, selected, point)!;
+        expect(anchor.point).toEqual({
+          x: primary.points[0].x,
+          y: primary.points[0].y,
+        });
+        expect(anchor.offset).toEqual({
+          x: primary.points[0].x - point.x,
+          y: primary.points[0].y - point.y,
+        });
+        for (const e of s.entities) {
+          expect(anchor.excluded.has(e.id)).toBe(true);
+          for (const p of e.points)
+            expect(anchor.excluded.has(p.id)).toBe(true);
+        }
+      }
+    },
+  );
+  it("preserves explicitly selected controls, single selections, and unselected hits", () => {
+    const e = controlFixtures[0],
+      peer = controlFixtures[1],
+      hit = { entityId: e.id, pointId: e.points[1].id };
+    expect(resolveDragSelection(hit, [{ entityId: e.id }])).toBe(hit);
+    expect(resolveDragSelection(hit, [hit, { entityId: peer.id }])).toBe(hit);
+    expect(
+      resolveDragSelection(hit, [
+        { entityId: e.id },
+        { entityId: peer.id, pointId: peer.points[0].id },
+      ]),
+    ).toBe(hit);
+    expect(
+      resolveDragSelection(hit, [{ entityId: peer.id }, { entityId: "other" }]),
+    ).toBe(hit);
+    expect(
+      resolveDragSelection(hit, [{ entityId: e.id }, { entityId: e.id }]),
+    ).toBe(hit);
+    const body = { entityId: e.id };
+    expect(
+      resolveDragSelection(body, [{ entityId: e.id }, { entityId: peer.id }]),
+    ).toBe(body);
+  });
+});
 
 describe("drag targeting", () => {
   it("anchors whole-body dragging at the entity point instead of the mouse grip", () => {

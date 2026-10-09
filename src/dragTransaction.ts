@@ -8,6 +8,10 @@ import {
 } from "./model";
 import { type SolverResult } from "./solver";
 import { type DragEvent, sameDragPosition } from "./dragging";
+import {
+  prepareDimensionLabels,
+  updateDimensionLabels,
+} from "./dimensionLabel";
 
 export type DragDriver = {
   pointId: string;
@@ -50,7 +54,10 @@ function bodyOwnership(sketch: Sketch) {
   }
   const fixed = new Set(
     sketch.constraints
-      .filter((constraint) => constraint.kind === "fixed")
+      .filter(
+        (constraint) =>
+          constraint.kind === "fixed" || constraint.kind === "origin",
+      )
       .flatMap((constraint) => constraint.refs.map((ref) => owners.get(ref)))
       .filter((id): id is string => !!id),
   );
@@ -209,6 +216,7 @@ export function solveDrag(
     ? entity.points.find((item) => item.id === event.pointId)
     : entity.points[0];
   if (!point) throw new Error("控制点不存在");
+  prepareDimensionLabels(sketch);
   let bodyIds: Set<string> | undefined;
   if (!event.pointId) {
     bodyIds = new Set(
@@ -244,6 +252,7 @@ export function solveDrag(
   });
   if (!result.ok) throw new Error(result.message ?? "拖动目标无法满足现有约束");
   if (bodyIds) assertBodyTranslation(original, sketch, bodyIds, entity.id);
+  updateDimensionLabels(sketch);
   if (event.phase !== "end")
     return {
       document: candidate,
@@ -263,5 +272,6 @@ export function solveDrag(
       bodyIds,
       entity.id,
     );
+  updateDimensionLabels(final.sketches.find((item) => item.id === sketchId)!);
   return { document: final, result: finalResult, point: actual };
 }
