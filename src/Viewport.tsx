@@ -60,6 +60,7 @@ export interface ViewportProps {
   selection: Selection[];
   tool: Tool;
   drafts: XY[];
+  operationPreview?: Entity[] | null;
   config: CreateConfig;
   grid: boolean;
   snap: boolean;
@@ -205,6 +206,7 @@ export function Viewport(props: ViewportProps) {
         ? (current.dimensionGuides ?? [])
         : current.drafts,
       preview: [],
+      operationPreview: current.operationPreview ?? null,
       cursor: null,
       snapPoint: null,
       marquee: null,
@@ -308,6 +310,15 @@ export function Viewport(props: ViewportProps) {
         }
         currentFrame.preview = previewCache.current.entities;
       }
+      const hovered =
+        pointer.current &&
+        current.tool === "select" &&
+        !activeGesture &&
+        !current.dimensionDraft &&
+        !current.dimensionAdjustment
+          ? renderer.current!.hitTest(pointer.current, currentFrame)
+          : null;
+      currentFrame.hoveredEntityId = hovered?.entityId ?? null;
       if (current.dimensionAdjustment && activeGesture?.mode === "dimension") {
         currentFrame.dimensionPreview!.labelPosition = activeGesture.target;
         if (
@@ -330,9 +341,7 @@ export function Viewport(props: ViewportProps) {
               sketch,
               current.dimensionPicks ?? [],
               current.dimensionKindMode,
-              pointer.current
-                ? renderer.current!.hitTest(pointer.current, currentFrame)
-                : null,
+              hovered,
             )
           : null;
         currentFrame.dimensionPreview = request
@@ -363,7 +372,10 @@ export function Viewport(props: ViewportProps) {
     const sketches = propsRef.current.sketches.filter(
         (sketch) => sketch.visible,
       ),
-      visible = sketches.flatMap((sketch) => sketch.entities);
+      visible = [
+        ...sketches.flatMap((sketch) => sketch.entities),
+        ...(propsRef.current.operationPreview ?? []),
+      ];
     const extent = bounds(visible),
       currentSize = sizeRef.current;
     for (const sketch of sketches) {
@@ -520,6 +532,7 @@ export function Viewport(props: ViewportProps) {
     props.selection,
     props.tool,
     props.drafts,
+    props.operationPreview,
     props.config,
     props.grid,
     props.snap,

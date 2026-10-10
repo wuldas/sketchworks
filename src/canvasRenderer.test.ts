@@ -74,6 +74,111 @@ function fakeCanvas(): HTMLCanvasElement {
 }
 afterEach(() => vi.unstubAllGlobals());
 describe("retained Canvas renderer", () => {
+  it("culls and caches operation previews without changing the real scene or picking", () => {
+    vi.stubGlobal("Path2D", FakePath);
+    const source = entity("line", [
+      { x: -80, y: 20 },
+      { x: -70, y: 20 },
+    ]);
+    const s = sketch([source]),
+      before = clone(s),
+      r = new CanvasRenderer(),
+      canvas = fakeCanvas(),
+      f = frame();
+    r.sync([s], s.id);
+    r.draw(canvas, f);
+    const initial = r.metadata(f).stats;
+    const entities = Array.from({ length: 1000 }, (_, i) =>
+      entity("line", [
+        { x: i * 50, y: 20 },
+        { x: i * 50 + 10, y: 20 },
+      ]),
+    );
+    const preview = { ...f, operationPreview: entities };
+    r.draw(canvas, preview);
+    const metadata = r.metadata(preview);
+    expect(metadata.operationPreview?.entityCount).toBe(1000);
+    expect(metadata.operationPreview!.visibleEntities).toBeLessThan(10);
+    expect(metadata.operationPreview?.cachedPaths).toBe(
+      metadata.operationPreview?.visibleEntities,
+    );
+    expect(metadata.stats.sceneEntities).toBe(1);
+    expect(metadata.stats.baseDraws).toBe(initial.baseDraws);
+    expect(metadata.stats.compiledPaths).toBe(initial.compiledPaths);
+    expect(
+      r.hitTest(worldToScreen({ x: 1, y: 20 }, preview), preview),
+    ).toBeNull();
+    expect(
+      r.snap(
+        { x: 0, y: 20 },
+        { ...preview, snapOptions: { ...capturesOff, endpoint: true } },
+      ),
+    ).toBeNull();
+    const movedCursor = { ...preview, cursor: { x: 0, y: -20 } };
+    r.draw(canvas, movedCursor);
+    expect(r.metadata(movedCursor).operationPreview?.cachedPaths).toBe(
+      metadata.operationPreview?.cachedPaths,
+    );
+    expect(r.metadata(movedCursor).stats.baseDraws).toBe(initial.baseDraws);
+    r.draw(canvas, f);
+    expect(r.metadata(f).operationPreview).toBeNull();
+    expect(r.metadata(f).stats.baseDraws).toBe(initial.baseDraws);
+    expect(s).toEqual(before);
+  });
+
+  it("keeps hover emphasis in the overlay and restores the cached scene when cleared", () => {
+    vi.stubGlobal("Path2D", FakePath);
+    const e = entity("line", [
+      { x: 0, y: 20 },
+      { x: 20, y: 20 },
+    ]);
+    const s = sketch([e]),
+      r = new CanvasRenderer(),
+      canvas = fakeCanvas(),
+      f = frame();
+    const ctx = canvas.getContext("2d")!;
+    const strokes: {
+      color: string | CanvasGradient | CanvasPattern;
+      width: number;
+    }[] = [];
+    ctx.stroke = (() => {
+      strokes.push({ color: ctx.strokeStyle, width: ctx.lineWidth });
+    }) as typeof ctx.stroke;
+    r.sync([s], s.id);
+    r.draw(canvas, f);
+    const initial = r.metadata(f).stats;
+    const hover = { ...f, hoveredEntityId: e.id };
+    r.draw(canvas, hover);
+    expect(r.metadata(hover).hoveredEntityId).toBe(e.id);
+    expect(strokes).toEqual([{ color: "#195343", width: 3.4 / f.view.scale }]);
+    expect(r.metadata(hover).stats.baseDraws).toBe(initial.baseDraws);
+    expect(r.metadata(hover).stats.compiledPaths).toBe(initial.compiledPaths);
+    r.draw(canvas, f);
+    expect(r.metadata(f).hoveredEntityId).toBeNull();
+    expect(r.metadata(f).stats.baseDraws).toBe(initial.baseDraws);
+    expect(strokes).toHaveLength(1);
+    expect(f.selection).toEqual([]);
+  });
+
+  it("never emphasizes an inactive sketch or a removed hovered object", () => {
+    vi.stubGlobal("Path2D", FakePath);
+    const e = entity("circle", [{ x: 10, y: 10 }], { radius: 5 });
+    const other = sketch([e], { id: "other" });
+    const active = sketch([]),
+      r = new CanvasRenderer(),
+      canvas = fakeCanvas();
+    const f = frame({ hoveredEntityId: e.id });
+    r.sync([active, other], active.id);
+    r.draw(canvas, f);
+    expect(r.metadata(f).hoveredEntityId).toBeNull();
+    r.sync([other], other.id);
+    r.draw(canvas, f);
+    expect(r.metadata(f).hoveredEntityId).toBe(e.id);
+    r.sync([{ ...other, entities: [] }], other.id);
+    r.draw(canvas, f);
+    expect(r.metadata(f).hoveredEntityId).toBeNull();
+  });
+
   it("renders relative labels against current geometry even when the world cache has not been refreshed", () => {
     vi.stubGlobal("Path2D", FakePath);
     const e = entity("line", [

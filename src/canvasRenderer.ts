@@ -57,10 +57,12 @@ export interface CanvasFrame {
   unit: "mm" | "in";
   drafts: XY[];
   preview: Entity[];
+  operationPreview?: Entity[] | null;
   cursor: XY | null;
   snapPoint: CanvasSnap | null;
   marquee: { a: XY; b: XY } | null;
   dimensionSelection?: string | null;
+  hoveredEntityId?: string | null;
   dimensionPreview?: CanvasDimensionPreview | null;
 }
 export interface CanvasHandle extends Selection {
@@ -92,6 +94,13 @@ export interface CanvasMetadata {
   spacing: number;
   gridStep: number;
   gridVisible: boolean;
+  hoveredEntityId: string | null;
+  operationPreview: {
+    entityCount: number;
+    visibleEntities: number;
+    cachedPaths: number;
+    revision: number;
+  } | null;
   snapOptions: SnapOptions;
   dimensions: {
     id: string;
@@ -338,6 +347,12 @@ export class CanvasRenderer {
   private handleActiveId = "";
   private labels: DimensionPaint[] = [];
   private previewLabel: DimensionPaint | null = null;
+  private hoveredEntityId: string | null = null;
+  private operationPreviewEntities: Entity[] | null = null;
+  private operationPreviewIndex = new RBush<Prepared>();
+  private operationPreviewVisible = 0;
+  private operationPreviewCached = 0;
+  private operationPreviewRevision = 0;
   private lastDrawn = 0;
   private lastCulled = 0;
   private sketches: Sketch[] = [];
@@ -531,6 +546,15 @@ export class CanvasRenderer {
       spacing: gridStepForScale(frame.view.scale) * frame.view.scale,
       gridStep: gridStepForScale(frame.view.scale),
       gridVisible: frame.grid,
+      hoveredEntityId: this.hoveredEntityId,
+      operationPreview: this.operationPreviewEntities
+        ? {
+            entityCount: this.operationPreviewEntities.length,
+            visibleEntities: this.operationPreviewVisible,
+            cachedPaths: this.operationPreviewCached,
+            revision: this.operationPreviewRevision,
+          }
+        : null,
       snapOptions: frame.snapOptions ?? {
         ...defaultSnapOptions,
         grid: frame.grid,
@@ -650,15 +674,13 @@ export class CanvasRenderer {
       })))
       ctx.fill(path);
     for (const item of visible) {
-      const e = item.entity,
-        color = selected.has(e.id)
-          ? "#d29423"
-          : item.sketchId !== this.activeId
-            ? "#a6b6ae"
-            : e.construction
-              ? "#729baf"
-              : "#267f67";
-      this.paintEntity(ctx, e, frame, color, item);
+      this.paintEntity(
+        ctx,
+        item.entity,
+        frame,
+        this.entityColor(item, selected.has(item.entity.id)),
+        item,
+      );
     }
     this.setScreen(ctx, frame);
     this.labels = this.layoutDimensions(ctx, frame);
@@ -763,6 +785,37 @@ export class CanvasRenderer {
     }));
     this.paintBadges(ctx, frame);
   }
+  private entityColor(item: Prepared, selected: boolean): string {
+    return selected
+      ? "#d29423"
+      : item.sketchId !== this.activeId
+        ? "#a6b6ae"
+        : item.entity.construction
+          ? "#729baf"
+          : "#267f67";
+  }
+  private paintHover(ctx: CanvasRenderingContext2D, frame: CanvasFrame) {
+    this.hoveredEntityId = null;
+    const item = frame.hoveredEntityId
+      ? this.prepared.get(frame.hoveredEntityId)
+      : undefined;
+    if (!item || item.sketchId !== this.activeId) return;
+    const color = this.entityColor(
+      item,
+      frame.selection.some((s) => s.entityId === item.entity.id),
+    );
+    const darker =
+      "#" +
+      [1, 3, 5]
+        .map((offset) =>
+          Math.round(parseInt(color.slice(offset, offset + 2), 16) * 0.65)
+            .toString(16)
+            .padStart(2, "0"),
+        )
+        .join("");
+    this.paintEntity(ctx, item.entity, frame, darker, item, false, true);
+    this.hoveredEntityId = item.entity.id;
+  }
   private paintEntity(
     ctx: CanvasRenderingContext2D,
     e: Entity,
@@ -770,6 +823,7 @@ export class CanvasRenderer {
     color: string,
     item?: Prepared,
     preview = false,
+    emphasized = false,
   ) {
     ctx.save();
     if (e.kind === "point") {
@@ -778,7 +832,7 @@ export class CanvasRenderer {
       circle(
         ctx,
         worldToScreen(e.points[0], frame),
-        preview ? 3 : 4,
+        emphasized ? 6 : preview ? 3 : 4,
         color,
         "#fff",
       );
@@ -787,14 +841,15 @@ export class CanvasRenderer {
       ctx.translate(e.points[0].x, e.points[0].y);
       ctx.rotate(((e.rotation ?? 0) * Math.PI) / 180);
       ctx.scale(1, -1);
-      ctx.font = `${e.fontSize ?? 6}px Arial, sans-serif`;
+      ctx.font = `${emphasized ? "bold " : ""}${e.fontSize ?? 6}px Arial, sans-serif`;
       ctx.textAlign = "left";
       ctx.textBaseline = "alphabetic";
       ctx.fillStyle = color;
       ctx.fillText(e.text ?? "", 0, 0);
     } else {
       this.setWorld(ctx, frame);
-      ctx.lineWidth = (preview ? 1.5 : 1.8) / frame.view.scale;
+      ctx.lineWidth =
+        (emphasized ? 3.4 : preview ? 1.5 : 1.8) / frame.view.scale;
       ctx.strokeStyle = color;
       ctx.setLineDash(
         (e.construction ? [8, 5] : preview ? [6, 4] : []).map(
@@ -1131,7 +1186,52 @@ export class CanvasRenderer {
     );
     ctx.restore();
   }
+  private paintOperationPreview(
+    ctx: CanvasRenderingContext2D,
+    frame: CanvasFrame,
+  ) {
+    const entities = frame.operationPreview ?? null;
+    if (entities !== this.operationPreviewEntities) {
+      this.operationPreviewRevision++;
+      this.operationPreviewEntities = entities;
+      this.operationPreviewIndex.clear();
+      this.operationPreviewCached = 0;
+      if (entities)
+        this.operationPreviewIndex.load(
+          entities.map((entity, order) => ({
+            ...canvasEntityBounds(entity),
+            entity,
+            order,
+            sketchId: this.activeId,
+            signature: "operation-preview",
+          })),
+        );
+    }
+    this.operationPreviewVisible = 0;
+    if (!entities) return;
+    const a = screenToWorld({ x: 0, y: 0 }, frame);
+    const b = screenToWorld({ x: frame.width, y: frame.height }, frame);
+    const margin = 10 / frame.view.scale;
+    const visible = this.operationPreviewIndex
+      .search({
+        minX: a.x - margin,
+        maxX: b.x + margin,
+        minY: b.y - margin,
+        maxY: a.y + margin,
+      })
+      .sort((a, b) => a.order - b.order);
+    this.operationPreviewVisible = visible.length;
+    for (const item of visible) {
+      if (!item.path && !["point", "text"].includes(item.entity.kind)) {
+        item.path = new Path2D(entityPath(item.entity));
+        this.operationPreviewCached++;
+      }
+      this.paintEntity(ctx, item.entity, frame, "#499ca7", item, true);
+    }
+  }
   private paintOverlay(ctx: CanvasRenderingContext2D, frame: CanvasFrame) {
+    this.paintHover(ctx, frame);
+    this.paintOperationPreview(ctx, frame);
     this.previewLabel = frame.dimensionPreview
       ? (this.layoutDimensions(ctx, frame, frame.dimensionPreview)[0] ?? null)
       : null;

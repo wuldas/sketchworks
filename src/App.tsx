@@ -1,4 +1,4 @@
-import { useCallback, useEffect, useRef, useState } from "react";
+import { useCallback, useEffect, useMemo, useRef, useState } from "react";
 import { flushSync } from "react-dom";
 import {
   MousePointer2,
@@ -92,7 +92,6 @@ import {
   sub,
   add,
   mul,
-  normalize,
   arcInfo,
   blendEntity,
 } from "./geometry";
@@ -111,7 +110,12 @@ import {
   canConstrain,
   type SolverResult,
 } from "./solver";
-import { modifySketch } from "./operations";
+import {
+  createOperationCandidate,
+  previewOperation,
+  resolveOperationInput,
+  type OperationInput,
+} from "./operationPreview";
 import {
   applyParameters,
   evaluateExpression,
@@ -521,42 +525,48 @@ export default function App() {
     clearTimeout(toastTimer.current);
     toastTimer.current = setTimeout(() => setToast(null), error ? 6500 : 3000);
   }, []);
-  const solveDocument = (
-    candidate: Document,
-    drag?: DragDriver,
-    solvingSketchId = activeId,
-  ): SolverResult => {
-    applyParameters(candidate);
-    let current: SolverResult = {
-      ok: true,
-      dof: 0,
-      status: "Success",
-      conflicting: [],
-    };
-    for (const sk of candidate.sketches) {
-      const derived = new Set(
-        sk.entities
-          .filter((e) => e.sourceId)
-          .flatMap((e) => [e.id, ...e.points.map((p) => p.id)]),
-      );
-      if (sk.constraints.some((c) => c.refs.some((r) => derived.has(r))))
-        throw new Error("派生对象请通过源对象编辑，或先解除关联");
-      const base = { ...sk, entities: sk.entities.filter((e) => !e.sourceId) };
-      const result = solveSketch(
-        base,
-        sk.id === solvingSketchId ? drag : undefined,
-      );
-      if (!result.ok)
-        throw Object.assign(new Error("约束无法满足，已保留原草图"), {
-          conflicting: result.conflicting,
-        });
-      updateDerived(sk);
-      validGeometry(sk);
-      updateDimensionLabels(sk);
-      if (sk.id === solvingSketchId) current = result;
-    }
-    return current;
-  };
+  const solveDocument = useCallback(
+    (
+      candidate: Document,
+      drag?: DragDriver,
+      solvingSketchId = activeId,
+    ): SolverResult => {
+      applyParameters(candidate);
+      let current: SolverResult = {
+        ok: true,
+        dof: 0,
+        status: "Success",
+        conflicting: [],
+      };
+      for (const sk of candidate.sketches) {
+        const derived = new Set(
+          sk.entities
+            .filter((e) => e.sourceId)
+            .flatMap((e) => [e.id, ...e.points.map((p) => p.id)]),
+        );
+        if (sk.constraints.some((c) => c.refs.some((r) => derived.has(r))))
+          throw new Error("派生对象请通过源对象编辑，或先解除关联");
+        const base = {
+          ...sk,
+          entities: sk.entities.filter((e) => !e.sourceId),
+        };
+        const result = solveSketch(
+          base,
+          sk.id === solvingSketchId ? drag : undefined,
+        );
+        if (!result.ok)
+          throw Object.assign(new Error("约束无法满足，已保留原草图"), {
+            conflicting: result.conflicting,
+          });
+        updateDerived(sk);
+        validGeometry(sk);
+        updateDimensionLabels(sk);
+        if (sk.id === solvingSketchId) current = result;
+      }
+      return current;
+    },
+    [activeId],
+  );
   const commit = (candidate: Document, label = "操作", record = true) => {
     if (!ready) {
       notify("求解器正在加载", true);
@@ -954,7 +964,7 @@ export default function App() {
       ),
     );
   };
-  const commandError = command
+  const commandInputError = command
     ? (commandGeometryError(command) ??
       (command.type === "constraint" &&
       canConstrain(
@@ -965,6 +975,14 @@ export default function App() {
         ? "选取的对象不适用于此约束，请修改几何参数"
         : null))
     : null;
+  const operationPreview = useMemo(
+    () =>
+      !ready || commandInputError
+        ? { entities: null, error: null }
+        : previewOperation(doc, sketch.id, command, solveDocument),
+    [doc, sketch.id, command, ready, commandInputError, solveDocument],
+  );
+  const commandError = commandInputError ?? operationPreview.error;
   const pickCommand = (picked: Selection | null, point: XY) => {
     if (!command) return;
     const active = command.geometry[command.active];
@@ -1492,54 +1510,19 @@ export default function App() {
     value: number,
     units = unit,
   ): Field => ({ key, label, value: String(value), unit: units });
-  const runOperation = (
-    operation: string,
-    values: Record<string, number>,
-    ids: string[],
-    pick?: XY,
-    expressions?: Record<string, string>,
-  ) => {
+  const runOperation = (input: OperationInput) => {
     try {
-      const next = clone(docRef.current),
-        s = next.sketches.find((s) => s.id === activeId)!;
-      const result = modifySketch(s, ids, operation, values, pick);
-      if (expressions) {
-        const beforeIds = new Set(sketch.entities.map((e) => e.id));
-        for (const e of s.entities) {
-          if (beforeIds.has(e.id) || !e.transform) continue;
-          const t = e.transform;
-          if (
-            operation === "rectangularArray" &&
-            (expressions.dx || expressions.dy)
-          ) {
-            const u = normalize({ x: values.ux ?? 1, y: values.uy ?? 0 });
-            const x = t.x ?? 0,
-              y = t.y ?? 0;
-            const along = x * u.x + y * u.y;
-            const across = -x * u.y + y * u.x;
-            const first =
-              expressions.dx && Math.abs(values.dx) > 1e-9
-                ? `${along / values.dx}*(${expressions.dx})`
-                : String(along);
-            const second =
-              expressions.dy && Math.abs(values.dy) > 1e-9
-                ? `${across / values.dy}*(${expressions.dy})`
-                : String(across);
-            t.xExpression = `${u.x}*(${first})-(${u.y})*(${second})`;
-            t.yExpression = `${u.y}*(${first})+${u.x}*(${second})`;
-          }
-          if (
-            operation === "circularArray" &&
-            expressions.angle &&
-            Math.abs(values.angle) > 1e-9
-          )
-            t.angleExpression = `${(t.angle ?? 0) / values.angle}*(${expressions.angle})`;
-        }
-      }
-      if (result.removedConstraints.length) {
+      const { operation } = input;
+      const candidate = createOperationCandidate(
+        docRef.current,
+        activeId,
+        input,
+      );
+      const next = candidate.document;
+      if (candidate.removedConstraints.length) {
         setModal({
           title: "确认修改几何",
-          description: `此操作将移除 ${result.removedConstraints.length} 项受影响的约束：${result.removedConstraints.map((id) => constraintLabels[sketch.constraints.find((c) => c.id === id)!.kind]).join("、")}`,
+          description: `此操作将移除 ${candidate.removedConstraints.length} 项受影响的约束：${candidate.removedConstraints.map((id) => constraintLabels[sketch.constraints.find((c) => c.id === id)!.kind]).join("、")}`,
           fields: [],
           submit: "移除约束并修改",
           confirm: () => {
@@ -1678,68 +1661,7 @@ export default function App() {
       return;
     }
     try {
-      const values: Record<string, number> = {};
-      const vars = resolveParameters(docRef.current.parameters);
-      for (const f of command.fields) {
-        if (f.type === "select") continue;
-        values[f.key] =
-          evaluateExpression(
-            command.values[f.key],
-            vars,
-            f.unit === "°" ? "deg" : f.unit ? "mm" : "scalar",
-          ) *
-          (f.unit === unit && !hasParameterReferences(command.values[f.key])
-            ? factor
-            : 1);
-      }
-      if (command.name === "rectangularArray") {
-        const directionId = command.geometry.find((p) => p.key === "direction")
-          ?.selections[0]?.entityId;
-        const direction = sketch.entities.find((e) => e.id === directionId);
-        if (direction) {
-          const vector = normalize(
-            sub(direction.points[1], direction.points[0]),
-          );
-          values.ux = vector.x;
-          values.uy = vector.y;
-        }
-        values.range = command.values.distribution === "范围" ? 1 : 0;
-        values.direction1 =
-          command.values.direction1 === "反向"
-            ? -1
-            : command.values.direction1 === "对称"
-              ? 0
-              : 1;
-        values.direction2 =
-          command.values.direction2 === "反向"
-            ? -1
-            : command.values.direction2 === "对称"
-              ? 0
-              : 1;
-      }
-      const position = command.geometry.find(
-        (p) => p.kind === "position",
-      )?.position;
-      if (
-        position &&
-        ["rotate", "scale", "circularArray"].includes(command.name)
-      ) {
-        values.cx = position.x;
-        values.cy = position.y;
-      }
-      const ids =
-        command.name === "mirror"
-          ? picked.map((s) => s.entityId)
-          : command.geometry
-              .find((p) => p.key === "objects")!
-              .selections.map((s) => s.entityId);
-      const expressions = Object.fromEntries(
-        command.fields
-          .filter((f) => f.type !== "select")
-          .map((f) => [f.key, command.values[f.key]])
-          .filter(([, v]) => hasParameterReferences(v)),
-      );
-      runOperation(command.name, values, ids, position, expressions);
+      runOperation(resolveOperationInput(docRef.current, activeId, command));
     } catch (error) {
       notify((error as Error).message, true);
     }
@@ -2635,6 +2557,7 @@ export default function App() {
             selection={displayedSelection}
             tool={tool}
             drafts={drafts}
+            operationPreview={operationPreview.entities}
             config={config}
             grid={grid}
             snap={snap}
