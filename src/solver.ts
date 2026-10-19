@@ -904,15 +904,42 @@ function solveNative(
           if (kinds.includes("line")) {
             const line = e1!.kind === "line" ? e1! : e2!,
               curve = e1!.kind === "line" ? e2! : e1!;
-            const contact = s.constraints
-              .filter((binding) => binding.kind === "onCurve")
-              .map((binding) => pointAndCurve(s, binding.refs))
-              .find(
-                (pair) =>
-                  pair &&
-                  pair[1].id === curve.id &&
-                  line.points.slice(0, 2).some((p) => p.id === pair[0].id),
-              )?.[0];
+            let contact: Point | undefined;
+            for (const binding of s.constraints) {
+              if (binding.kind === "onCurve") {
+                const pair = pointAndCurve(s, binding.refs);
+                if (pair && pair[1].id === curve.id)
+                  contact = line.points.find((p) => p.id === pair[0].id);
+              } else if (
+                curve.kind === "arc" &&
+                binding.kind === "coincident"
+              ) {
+                const first = pointRef(s, binding.refs[0]),
+                  second = pointRef(s, binding.refs[1]);
+                for (const p of line.points) {
+                  const other =
+                    first?.id === p.id
+                      ? second
+                      : second?.id === p.id
+                        ? first
+                        : undefined;
+                  if (
+                    other &&
+                    (other.id === curve.points[1].id ||
+                      other.id === curve.points[2].id)
+                  ) {
+                    contact = p;
+                    break;
+                  }
+                }
+              }
+              if (contact) break;
+            }
+            if (!contact && curve.kind === "arc")
+              contact = line.points.find(
+                (p) =>
+                  p.id === curve.points[1].id || p.id === curve.points[2].id,
+              );
             if (contact) {
               // A contact radius avoids the dependent incidence/distance-tangency gradients.
               const id = `__solver_${c.id}_contact_${primitives.length}`;

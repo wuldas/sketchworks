@@ -158,11 +158,7 @@ export function Viewport(props: ViewportProps) {
   );
   const lastCursorReport = useRef(0);
   const lastReportedCursor = useRef<XY | null>(null);
-  const terminalCapture = useRef<{
-    anchorId?: string;
-    target: XY;
-    snapPoint: CanvasSnap | null;
-  } | null>(null);
+  const terminalCapture = useRef<XY | null>(null);
   const fitState = useRef<{ measured: boolean; fitKey: number }>({
     measured: false,
     fitKey: props.fitKey,
@@ -233,6 +229,24 @@ export function Viewport(props: ViewportProps) {
           : null,
     };
   }, []);
+  const canSnap = useCallback(() => {
+    const current = propsRef.current,
+      activeGesture = gesture.current;
+    if (
+      !current.snap ||
+      (!activeGesture && space.current) ||
+      current.pickDimension ||
+      current.dimensionDraft ||
+      current.dimensionAdjustment
+    )
+      return false;
+    if (activeGesture?.mode === "drag")
+      return activeGesture.moved && !activeGesture.additive;
+    if (activeGesture && activeGesture.mode !== "place") return false;
+    return current.pickParameters
+      ? current.pickParameters === "position"
+      : current.tool !== "select";
+  }, []);
   const requestDraw = useCallback(() => {
     if (drawFrame.current !== null) return;
     drawFrame.current = requestAnimationFrame(() => {
@@ -243,17 +257,14 @@ export function Viewport(props: ViewportProps) {
         currentFrame = frame(),
         activeGesture = gesture.current;
       if (pointer.current) {
-        const capture =
-          activeGesture?.mode === "drag"
-            ? activeGesture
-            : terminalCapture.current;
+        const capture = activeGesture?.mode === "drag" ? activeGesture : null;
         if (capture) {
           currentFrame.cursor = capture.target;
           const actual = capture.anchorId
             ? renderer.current!.position(capture.anchorId)
             : undefined;
           if (
-            current.snap &&
+            canSnap() &&
             capture.snapPoint &&
             isSnapEnabled(
               capture.snapPoint.kind,
@@ -262,9 +273,11 @@ export function Viewport(props: ViewportProps) {
             sameDragPosition(actual ?? null, capture.target)
           )
             currentFrame.snapPoint = capture.snapPoint;
+        } else if (terminalCapture.current) {
+          currentFrame.cursor = terminalCapture.current;
         } else {
           const proposed = toWorld(pointer.current);
-          if (current.snap && activeGesture?.mode !== "dimension")
+          if (canSnap())
             currentFrame.snapPoint = renderer.current!.snap(
               proposed,
               currentFrame,
@@ -359,7 +372,7 @@ export function Viewport(props: ViewportProps) {
       renderer.current!.draw(surface, currentFrame);
       surface.__cadViewport = renderer.current!.metadata(currentFrame);
     });
-  }, [frame, toWorld]);
+  }, [canSnap, frame, toWorld]);
   const updateView = useCallback(
     (next: CanvasView) => {
       viewRef.current = next;
@@ -447,7 +460,8 @@ export function Viewport(props: ViewportProps) {
             (p) => p.id !== selected.pointId,
           );
       }
-      const nearest = current.snap
+      const snapping = canSnap();
+      const nearest = snapping
         ? renderer.current!.snap(
             proposed,
             currentFrame,
@@ -455,7 +469,7 @@ export function Viewport(props: ViewportProps) {
           )
         : null;
       const previous =
-        current.snap &&
+        snapping &&
         currentGesture.snapPoint?.kind !== "tangent" &&
         currentGesture.snapPoint?.kind !== "intersection" &&
         isSnapEnabled(
@@ -464,14 +478,14 @@ export function Viewport(props: ViewportProps) {
         )
           ? currentGesture.snapPoint
           : null;
-      const resolved = current.snap
+      const resolved = snapping
         ? resolveDragSnap(proposed, previous, nearest, currentFrame.view.scale)
         : { target: proposed, snap: null };
       currentGesture.target = resolved.target;
       currentGesture.snapPoint = resolved.snap;
       return resolved;
     },
-    [frame, toWorld],
+    [canSnap, frame, toWorld],
   );
   const flushDrag = useCallback(() => {
     if (inputFrame.current !== null) cancelAnimationFrame(inputFrame.current);
@@ -504,13 +518,7 @@ export function Viewport(props: ViewportProps) {
         phase: "cancel",
       });
     terminalCapture.current =
-      current?.mode === "drag"
-        ? {
-            anchorId: current.anchorId,
-            target: current.startWorld,
-            snapPoint: null,
-          }
-        : null;
+      current?.mode === "drag" ? current.startWorld : null;
     gesture.current = null;
     setPanning(false);
     if (current && canvas.current?.hasPointerCapture(current.id))
@@ -539,6 +547,7 @@ export function Viewport(props: ViewportProps) {
     props.snapOptions,
     props.unit,
     props.pickDimension,
+    props.pickParameters,
     props.dimensionGuides,
     props.dimensionPicks,
     props.dimensionKindMode,
@@ -614,11 +623,15 @@ export function Viewport(props: ViewportProps) {
       if (event.code === "Space") {
         space.current = true;
         event.preventDefault();
+        requestDraw();
       }
       if (event.key === "Escape") cancelGesture();
     };
     const up = (event: KeyboardEvent) => {
-      if (event.code === "Space") space.current = false;
+      if (event.code === "Space") {
+        space.current = false;
+        requestDraw();
+      }
     };
     const blur = () => {
       space.current = false;
@@ -632,7 +645,7 @@ export function Viewport(props: ViewportProps) {
       window.removeEventListener("keyup", up);
       window.removeEventListener("blur", blur);
     };
-  }, [cancelGesture]);
+  }, [cancelGesture, requestDraw]);
   useEffect(
     () => () => {
       if (drawFrame.current !== null) cancelAnimationFrame(drawFrame.current);
@@ -827,10 +840,9 @@ export function Viewport(props: ViewportProps) {
         ? resolveTarget(point, activeGesture)
         : (() => {
             const raw = toWorld(point);
-            const snap =
-              current.snap && activeGesture?.mode !== "dimension"
-                ? renderer.current!.snap(raw, currentFrame)
-                : null;
+            const snap = canSnap()
+              ? renderer.current!.snap(raw, currentFrame)
+              : null;
             return { target: snap?.point ?? raw, snap };
           })();
     const target = resolution.target;
@@ -948,11 +960,7 @@ export function Viewport(props: ViewportProps) {
         exact: !!resolved.snap,
       });
       const actual = feedback?.point ?? resolved.target;
-      terminalCapture.current = {
-        anchorId: activeGesture.anchorId,
-        target: actual,
-        snapPoint: feedback?.ok === false ? null : resolved.snap,
-      };
+      terminalCapture.current = actual;
       lastReportedCursor.current = { ...actual };
       current.onCursor(actual);
     } else if (
@@ -972,7 +980,7 @@ export function Viewport(props: ViewportProps) {
     } else if (activeGesture.mode === "place" && !activeGesture.moved) {
       if (current.pickParameters) {
         const snap =
-          current.pickParameters === "position" && current.snap
+          current.pickParameters === "position" && canSnap()
             ? renderer.current!.snap(world, currentFrame)
             : null;
         current.onParameterPick?.(
@@ -985,7 +993,7 @@ export function Viewport(props: ViewportProps) {
           world,
         );
       } else if (!current.pickParameters) {
-        const candidate = current.snap
+        const candidate = canSnap()
           ? renderer.current!.snap(world, currentFrame)
           : null;
         current.onPlace(

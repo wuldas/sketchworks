@@ -255,6 +255,7 @@ try {
   await page.goto(url);
   await page.locator(".loading-overlay").waitFor({ state: "hidden" });
   await ready();
+  await page.getByRole("button", { name: "直线", exact: true }).click();
   await inspectGrid("Desktop initial grid");
   await pan(37, -23);
   await inspectGrid("Desktop panned grid");
@@ -265,6 +266,12 @@ try {
   await page
     .getByRole("combobox", { name: "单位", exact: true })
     .selectOption("in");
+  await page.waitForFunction(
+    () =>
+      document.querySelector('[data-testid="cad-canvas"]').__cadViewport
+        .snap === null,
+  );
+  await page.getByRole("button", { name: "直线", exact: true }).click();
   const inches = await inspectGrid("Inch display preserves grid coordinates");
   assert.deepEqual(inches.origin, before.origin);
   assert.equal(inches.spacing, before.spacing);
@@ -277,6 +284,7 @@ try {
   await page.reload();
   await page.locator(".loading-overlay").waitFor({ state: "hidden" });
   await ready();
+  await page.getByRole("button", { name: "直线", exact: true }).click();
   await inspectGrid("Mobile initial grid");
   await pan(-29, 19);
   await inspectGrid("Mobile panned grid");

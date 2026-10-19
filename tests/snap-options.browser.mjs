@@ -611,6 +611,113 @@ async function inspectLayout(session, filename) {
 
 try {
   await check(
+    "Capture follows coordinate input instead of idle selection",
+    mixed(),
+    async (session) => {
+      const probes = [
+        sourceA.points[0],
+        midpoint,
+        crossing,
+        tangent,
+        gridPoint(await session.metadata()),
+        anchor,
+        { x: 0, y: 0 },
+      ];
+      for (const point of probes)
+        assert.equal((await moveNear(session, point)).state.snap, null);
+
+      const target = await moveNear(session, sourceA.points[0]);
+      await toolButton(session, names.line).evaluate((element) =>
+        element.click(),
+      );
+      await settle(session);
+      assert.equal((await session.metadata()).snap?.kind, "endpoint");
+      await session.page.keyboard.press("Escape");
+      await settle(session);
+      assert.equal((await session.metadata()).snap, null);
+
+      await moveNear(
+        session,
+        gridPoint(await session.metadata(), 40, -30),
+        2,
+        1,
+      );
+      await session.page.mouse.down();
+      await moveNear(
+        session,
+        gridPoint(await session.metadata(), 30, 25),
+        2,
+        1,
+      );
+      assert.equal(
+        (await session.metadata()).snap,
+        null,
+        "box selection does not capture",
+      );
+      await session.page.mouse.up();
+      await toolButton(session, names.line).click();
+      assertSnap(await moveNear(session, sourceA.points[0]), "endpoint");
+      await session.page.keyboard.down("Space");
+      await settle(session);
+      assert.equal(
+        (await session.metadata()).snap,
+        null,
+        "pan intent suspends capture",
+      );
+      await session.page.keyboard.up("Space");
+      await settle(session);
+      assert.equal((await session.metadata()).snap?.kind, "endpoint");
+      await session.page.mouse.down({ button: "middle" });
+      await settle(session);
+      assert.equal(
+        (await session.metadata()).snap,
+        null,
+        "panning suspends capture",
+      );
+      await session.page.mouse.up({ button: "middle" });
+      await settle(session);
+      assert.equal((await session.metadata()).snap?.kind, "endpoint");
+      await finish(session);
+
+      await toolButton(session, "修剪").click();
+      const panel = session.page.getByTestId("parameter-panel");
+      await panel.waitFor();
+      await panel
+        .getByRole("button", { name: "选择对象", exact: true })
+        .click();
+      assert.equal(
+        (await moveNear(session, sourceA.points[0])).state.snap,
+        null,
+      );
+      await panel
+        .getByRole("button", { name: "选择修剪位置", exact: true })
+        .evaluate((element) => element.click());
+      await settle(session);
+      assert.equal((await session.metadata()).snap?.kind, "endpoint");
+      await panel
+        .getByRole("button", { name: "选择对象", exact: true })
+        .evaluate((element) => element.click());
+      await settle(session);
+      assert.equal((await session.metadata()).snap, null);
+      await panel
+        .getByRole("button", { name: "取消操作", exact: true })
+        .click();
+
+      await session.page
+        .getByRole("button", { name: "尺寸", exact: true })
+        .click();
+      assert.equal(
+        (await moveNear(session, sourceA.points[0])).state.snap,
+        null,
+      );
+      await finish(session);
+      assert.equal((await session.metadata()).snap, null);
+      assert.deepEqual((await session.metadata()).snapOptions, allEnabled);
+      return { probes: probes.length, target: target.position.local };
+    },
+  );
+
+  await check(
     "Default controls and grid visibility are independent session state",
     fixture(),
     async (session) => {
@@ -1123,6 +1230,7 @@ try {
     intersectionDoc,
     async (session) => {
       await only(session, ["intersection"]);
+      await toolButton(session, names.line).click();
       const enabled = await moveNear(session, crossing);
       assertSnap(enabled, "intersection");
       assert.equal(enabled.state.snap.ref, undefined);
@@ -1172,6 +1280,7 @@ try {
     ]),
     async (session) => {
       await only(session, ["intersection"]);
+      await toolButton(session, names.line).click();
       const target = { x: 4, y: 15 };
       const captured = await moveNear(session, target, 2, 1);
       assert.equal(captured.state.snap?.kind, "intersection");
@@ -1220,6 +1329,7 @@ try {
     mixed(),
     async (session) => {
       await only(session, ["endpoint", "tangent"]);
+      await toolButton(session, names.line).click();
       assertSnap(await moveNear(session, sourceA.points[0]), "endpoint");
       await master(session, false, true);
       assert.equal((await session.metadata()).snap, null);
@@ -1257,6 +1367,7 @@ try {
         "tangent",
       );
       await finish(session);
+      await toolButton(session, names.line).click();
       assert.notEqual(
         (await moveNear(session, sourceA.points[0])).state.snap?.kind,
         "endpoint",
@@ -1296,8 +1407,8 @@ try {
       };
       for (const key of Object.keys(labels)) {
         await only(session, [key]);
+        await toolButton(session, names.line).click();
         if (key === "tangent") {
-          await toolButton(session, names.line).click();
           await clickMoved(session, await moveNear(session, anchor, 0, 0));
         }
         const captured = await moveNear(session, points[key], 4, 2);

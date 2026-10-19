@@ -1,4 +1,5 @@
-import { describe, expect, it } from "vitest";
+import { beforeAll, describe, expect, it } from "vitest";
+import { createRequire } from "node:module";
 import {
   arcInfo,
   bezierAt,
@@ -20,6 +21,14 @@ import {
 } from "./model";
 import { modifySketch } from "./operations";
 import { updateDimensionLabels } from "./dimensionLabel";
+import { initSolver, solveSketch } from "./solver";
+
+const require = createRequire(import.meta.url);
+beforeAll(() =>
+  initSolver(
+    require.resolve("@salusoft89/planegcs/dist/planegcs_dist/planegcs.wasm"),
+  ),
+);
 
 const line = (ax: number, ay: number, bx: number, by: number) =>
   entity("line", [
@@ -366,6 +375,93 @@ describe("sketch transformations", () => {
 });
 
 describe("fillet and chamfer topology", () => {
+  const joined = (
+    s: Sketch,
+    lineIndex: number,
+    endpoint: number,
+    arcIndex: number,
+    arcEndpoint: number,
+  ) => {
+    const line = s.entities[lineIndex],
+      arc = s.entities[arcIndex];
+    expect(dist(line.points[endpoint], arc.points[arcEndpoint])).toBeLessThan(
+      1e-6,
+    );
+    const radius = sub(arc.points[arcEndpoint], arc.points[0]),
+      direction = sub(line.points[1], line.points[0]);
+    expect(
+      Math.abs(dot(radius, direction)) /
+        (Math.hypot(radius.x, radius.y) * Math.hypot(direction.x, direction.y)),
+    ).toBeLessThan(1e-6);
+  };
+  it.each([false, true])(
+    "keeps fillet contacts and line directions when its radius changes, reversed line %s",
+    (reverse) => {
+      const a = reverse ? line(10, 0, 0, 0) : line(0, 0, 10, 0),
+        b = line(0, 10, 0, 0),
+        s = sketch(a, b);
+      s.constraints.push(
+        { id: "horizontal", kind: "horizontal", refs: [a.id] },
+        { id: "vertical", kind: "vertical", refs: [b.id] },
+      );
+      modifySketch(s, [a.id, b.id], "fillet", { radius: 2 });
+      const arc = s.entities[2];
+      s.constraints.push(
+        { id: "anchor-a", kind: "fixed", refs: [a.points[reverse ? 0 : 1].id] },
+        { id: "anchor-b", kind: "fixed", refs: [b.points[0].id] },
+        { id: "radius", kind: "radius", refs: [arc.id], value: 3 },
+      );
+      expect(solveSketch(s)).toMatchObject({ ok: true });
+      expect(arcInfo(arc).r).toBeCloseTo(3, 6);
+      joined(s, 0, reverse ? 1 : 0, 2, 1);
+      joined(s, 1, 1, 2, 2);
+      expect(arc.points[0].x).toBeCloseTo(3, 6);
+      expect(arc.points[0].y).toBeCloseTo(3, 6);
+      valid(s);
+    },
+  );
+  it("keeps an earlier fillet connected and tangent when the other end of its line is rounded", () => {
+    const top = line(0, 20, 20, 20),
+      left = line(0, 0, 0, 20),
+      bottom = line(20, 0, 0, 0),
+      s = sketch(top, left, bottom);
+    s.constraints.push(
+      { id: "top-axis", kind: "horizontal", refs: [top.id] },
+      { id: "left-axis", kind: "vertical", refs: [left.id] },
+      { id: "bottom-axis", kind: "horizontal", refs: [bottom.id] },
+      {
+        id: "top-joint",
+        kind: "coincident",
+        refs: [top.points[0].id, left.points[1].id],
+      },
+      {
+        id: "bottom-joint",
+        kind: "coincident",
+        refs: [left.points[0].id, bottom.points[1].id],
+      },
+    );
+    modifySketch(s, [top.id, left.id], "fillet", { radius: 3 });
+    modifySketch(s, [left.id, bottom.id], "fillet", { radius: 3 });
+    s.constraints.push(
+      { id: "top-anchor", kind: "fixed", refs: [top.points[1].id] },
+      { id: "bottom-anchor", kind: "fixed", refs: [bottom.points[0].id] },
+      { id: "top-radius", kind: "radius", refs: [s.entities[3].id], value: 5 },
+      {
+        id: "bottom-radius",
+        kind: "radius",
+        refs: [s.entities[4].id],
+        value: 3,
+      },
+    );
+    expect(solveSketch(s)).toMatchObject({ ok: true });
+    expect(arcInfo(s.entities[3]).r).toBeCloseTo(5, 6);
+    expect(arcInfo(s.entities[4]).r).toBeCloseTo(3, 6);
+    joined(s, 0, 0, 3, 1);
+    joined(s, 1, 1, 3, 2);
+    joined(s, 1, 0, 4, 1);
+    joined(s, 2, 1, 4, 2);
+    valid(s);
+  });
   it.each([false, true])(
     "makes a tangent fillet with reversed endpoint order %s",
     (reverse) => {

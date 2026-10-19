@@ -1,5 +1,6 @@
 import { circularDimensionEndpoints } from "./circularDimension";
 import RBush from "rbush";
+import paper from "paper";
 import {
   type Constraint,
   type Entity,
@@ -17,6 +18,7 @@ import {
   entityPath,
   intersections,
   pointLineDistance,
+  paperPath,
   projection,
   splineBezierSegments,
 } from "./geometry";
@@ -1320,7 +1322,7 @@ export class CanvasRenderer {
       ctx.fillRect(x, y, w, h);
       ctx.strokeStyle = "#2b8769";
       ctx.lineWidth = 1;
-      ctx.setLineDash([5, 3]);
+      ctx.setLineDash(b.y < a.y ? [5, 3] : []);
       ctx.strokeRect(x, y, w, h);
       ctx.setLineDash([]);
     }
@@ -1522,20 +1524,57 @@ export class CanvasRenderer {
       minY: Math.min(worldA.y, worldB.y),
       maxY: Math.max(worldA.y, worldB.y),
     };
-    return this.scene
-      .search(box)
-      .filter((item) => {
-        if (item.sketchId !== this.activeId) return false;
+    // Canvas Y points down, while the world coordinates passed here point up.
+    const crossing = worldB.y > worldA.y;
+    const selected: Prepared[] = [];
+    let boundary: paper.Path | null = null;
+    try {
+      for (const item of this.scene.search(box)) {
+        if (item.sketchId !== this.activeId) continue;
         const b = this.tightBounds(item);
-        return (
+        if (
           b.minX >= box.minX - 1e-7 &&
           b.maxX <= box.maxX + 1e-7 &&
           b.minY >= box.minY - 1e-7 &&
           b.maxY <= box.maxY + 1e-7
-        );
-      })
-      .sort((a, b) => a.order - b.order)
-      .map((item) => item.entity.id);
+        ) {
+          selected.push(item);
+          continue;
+        }
+        if (
+          !crossing ||
+          b.maxX < box.minX ||
+          b.minX > box.maxX ||
+          b.maxY < box.minY ||
+          b.minY > box.maxY
+        )
+          continue;
+        if (item.entity.kind === "text") {
+          selected.push(item);
+          continue;
+        }
+        const path = paperPath(item.entity);
+        try {
+          if (path.firstSegment && inBox(path.firstSegment.point, box, 1e-7)) {
+            selected.push(item);
+            continue;
+          }
+          boundary ??= new paper.Path.Rectangle({
+            from: [box.minX - 1e-7, box.minY - 1e-7],
+            to: [box.maxX + 1e-7, box.maxY + 1e-7],
+            insert: false,
+          });
+          if (path.intersects(boundary)) selected.push(item);
+        } finally {
+          path.remove();
+        }
+      }
+      return selected
+        .sort((a, b) => a.order - b.order)
+        .map((item) => item.entity.id);
+    } finally {
+      boundary?.remove();
+    }
   }
   position(pointId: string): XY | undefined {
     const point = this.pointRefs.get(pointId);
