@@ -703,9 +703,7 @@ try {
         .getByRole("button", { name: "取消操作", exact: true })
         .click();
 
-      await session.page
-        .getByRole("button", { name: "尺寸", exact: true })
-        .click();
+      await session.page.locator('button[title="草图尺寸 (D)"]').click();
       assert.equal(
         (await moveNear(session, sourceA.points[0])).state.snap,
         null,
