@@ -1,5 +1,6 @@
 import ClipperLib from "clipper-lib";
 import {
+  type Constraint,
   type Entity,
   type Sketch,
   type Transform,
@@ -118,10 +119,11 @@ function removeAffected(
   changed: Entity[],
   points: string[],
   removed: Set<string>,
+  preserve?: (constraint: Constraint) => boolean,
 ) {
   const refs = new Set([...changed.map((e) => e.id), ...points]);
   sketch.constraints = sketch.constraints.filter((c) => {
-    if (!c.refs.some((r) => refs.has(r))) return true;
+    if (!c.refs.some((r) => refs.has(r)) || preserve?.(c)) return true;
     removed.add(c.id);
     return false;
   });
@@ -374,11 +376,51 @@ function corner(
   if (d1 >= lengths[0] - EPS || d2 >= lengths[1] - EPS)
     fail("圆角半径或倒角距离过大，会生成零长度线段");
   capacity(sketch, 1);
+  const movedPoints = selected.map((e, i) => e.points[endpoint[i]].id);
   removeAffected(
     sketch,
     selected,
-    selected.map((e, i) => e.points[endpoint[i]].id),
+    movedPoints,
     removed,
+    fillet
+      ? (constraint) => {
+          if (constraint.refs.some((ref) => movedPoints.includes(ref)))
+            return false;
+          // Shortening a line leaves its support line and far-end contact unchanged.
+          if (
+            [
+              "horizontal",
+              "vertical",
+              "parallel",
+              "perpendicular",
+              "collinear",
+              "angle",
+            ].includes(constraint.kind)
+          )
+            return true;
+          if (constraint.kind !== "tangent") return false;
+          return selected.some(
+            (line, i) =>
+              constraint.refs.includes(line.id) &&
+              sketch.entities.some(
+                (curve) =>
+                  curve.kind === "arc" &&
+                  constraint.refs.includes(curve.id) &&
+                  curve.points.some(
+                    (point, index) =>
+                      index > 0 &&
+                      (point.id === far[i].id ||
+                        sketch.constraints.some(
+                          (binding) =>
+                            binding.kind === "coincident" &&
+                            binding.refs.includes(point.id) &&
+                            binding.refs.includes(far[i].id),
+                        )),
+                  ),
+              ),
+          );
+        }
+      : undefined,
   );
   selected.forEach((e, i) =>
     Object.assign(e.points[endpoint[i]], added.points[fillet ? i + 1 : i], {
@@ -386,6 +428,17 @@ function corner(
     }),
   );
   sketch.entities.push(added);
+  if (fillet)
+    selected.forEach((line, i) =>
+      sketch.constraints.push(
+        {
+          id: uid("c"),
+          kind: "coincident",
+          refs: [line.points[endpoint[i]].id, added.points[i + 1].id],
+        },
+        { id: uid("c"), kind: "tangent", refs: [line.id, added.id] },
+      ),
+    );
 }
 function orderedChain(
   selected: Entity[],

@@ -506,8 +506,20 @@ async function finishFresh(
       0,
       "disabled auto-constraint creates no coincidence",
     );
+  await button(session.page, "\u9009\u62e9").click();
+  const idleHover = await moveNear(session, last, [7, 1]);
+  const idleInk = await cuePixels(session, idleHover.position.local);
+  assert.equal(
+    idleHover.state.snap,
+    null,
+    "returning to select after finishing clears the endpoint capture cue",
+  );
+  assert(
+    !idleInk.endpointText && !idleInk.circularDraw,
+    "select idle after finish renders no endpoint cue ring or label",
+  );
+  session.detail.selectIdleCue = idleInk;
   if (moveSource && autoConstraint) {
-    await button(session.page, "\u9009\u62e9").click();
     await drag(session, { x: 35, y: -15 }, { x: 40, y: -6 }, [0, 0]);
     const movedDoc = await saved(session),
       movedSpline = byId(movedDoc, spline.id),
@@ -574,6 +586,17 @@ async function assertDragCapture(
     sketch(doc).constraints,
     sketch(before).constraints,
     "endpoint drag retains all constraints",
+  );
+  const released = await moveNear(session, target, [7, 1]);
+  const releasedInk = await cuePixels(session, released.position.local);
+  assert.equal(
+    released.state.snap,
+    null,
+    "released drag leaves no endpoint capture cue in select idle",
+  );
+  assert(
+    !releasedInk.endpointText && !releasedInk.circularDraw,
+    "select idle after released drag renders no endpoint cue ring or label",
   );
   return { before, doc };
 }
@@ -674,6 +697,43 @@ try {
       drawingFixture(),
       (session) => finishFresh(session),
       { deviceScaleFactor: 2, viewport: { width: 1440, height: 900 } },
+    );
+
+    await check(
+      "Escape cancel returns to select and clears the endpoint capture cue",
+      drawingFixture(),
+      async (session) => {
+        await startSpline(session);
+        const firstCapture = await capture(
+          session,
+          sourceA.points[0],
+          sourceA.points[0].id,
+        );
+        await click(session, sourceA.points[0], [7, 1]);
+        await session.page.keyboard.press("Escape");
+        await settle(session);
+        const idleHover = await moveNear(session, sourceA.points[0], [7, 1]);
+        const idleInk = await cuePixels(session, idleHover.position.local);
+        const doc = await saved(session);
+        session.detail = {
+          cancelledCapture: { snap: firstCapture.snap, ink: firstCapture.ink },
+          selectIdleCue: idleInk,
+          entities: sketch(doc).entities.map((item) => item.kind),
+        };
+        assert.equal(
+          idleHover.state.snap,
+          null,
+          "cancel returns to select and clears the capture cue",
+        );
+        assert(
+          !idleInk.endpointText && !idleInk.circularDraw,
+          "cancelled draft renders no endpoint cue ring or label",
+        );
+        assert(
+          !sketch(doc).entities.some((item) => item.kind === "spline"),
+          "cancelled spline draft creates no spline",
+        );
+      },
     );
 
     await check(

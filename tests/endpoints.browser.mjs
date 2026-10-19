@@ -332,6 +332,12 @@ async function panZoom(session) {
     after: await session.metadata(),
   };
 }
+// Endpoint/grid cues are only captured while a drawing tool collects points,
+// so hover expectations enter the line tool explicitly.
+async function startDrawing(session) {
+  await button(session.page, "\u76f4\u7ebf").click();
+  await settle(session);
+}
 async function lineBetween(session, start, end, offsets = [7, 1]) {
   await button(session.page, "\u76f4\u7ebf").click();
   const first = await moveNear(session, start, ...offsets);
@@ -518,6 +524,7 @@ try {
       `Path endpoints and ten-CSS-pixel radius at DPR ${dpr}, initial and panned/zoomed`,
       documentFixture(paths),
       async (session) => {
+        await startDrawing(session);
         const samples = [];
         for (const transform of ["initial", "panzoom"]) {
           if (transform === "panzoom") await panZoom(session);
@@ -547,6 +554,7 @@ try {
     documentFixture(paths),
     async (session) => {
       await disableGrid(session);
+      await startDrawing(session);
       const probes = [
         { point: paths[2].points[1], kind: "point" },
         { point: paths[1].points[0], kind: "point" },
@@ -580,6 +588,7 @@ try {
       ]),
     ]),
     async (session) => {
+      await startDrawing(session);
       const info = await session.metadata();
       assert(
         0.9 * info.scale < 10,
@@ -616,6 +625,7 @@ try {
     drawingFixture(),
     async (session) => {
       await disableGrid(session);
+      await startDrawing(session);
       const enabled = await endpoint(
         session,
         sourceA.points[1],
@@ -982,6 +992,7 @@ try {
     drawingFixture(),
     async (session) => {
       await disableGrid(session);
+      await startDrawing(session);
       const captured = await endpoint(
         session,
         sourceA.points[1],
@@ -1029,6 +1040,7 @@ try {
     ),
     async (session) => {
       await disableGrid(session);
+      await startDrawing(session);
       const captured = await endpoint(session, derived.points[0], null, 7, 1);
       await screenshot(session, "desktop-derived-endpoint.png");
       const drawn = await lineBetween(session, derived.points[0], {
@@ -1088,6 +1100,7 @@ try {
         byId(detached, derived.id).points[0].id,
         derived.points[0].id,
       );
+      await startDrawing(session);
       const captured = await endpoint(
         session,
         derived.points[0],
@@ -1227,6 +1240,7 @@ try {
     "Grid capture remains an amber square rather than an endpoint cue",
     drawingFixture(),
     async (session) => {
+      await startDrawing(session);
       const state = await session.metadata();
       const point = {
         x: Math.round(35 / state.gridStep) * state.gridStep,
@@ -1251,6 +1265,7 @@ try {
       ]),
     ]),
     async (session) => {
+      await startDrawing(session);
       const captured = await endpoint(
         session,
         { x: 20, y: 15 },

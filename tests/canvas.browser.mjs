@@ -586,6 +586,59 @@ try {
     },
   );
   await check(
+    "Vertical marquee direction selects contained versus crossed geometry",
+    async () => {
+      const dragBox = async (from, to) => {
+        const start = await screen(desktop, from),
+          end = await screen(desktop, to);
+        await desktop.page.mouse.move(start.x, start.y);
+        await desktop.page.mouse.down();
+        await desktop.page.mouse.move(end.x, end.y, { steps: 6 });
+        await desktop.page.mouse.up();
+        await settle(desktop.page);
+        assert.equal((await desktop.viewportState()).snap, null);
+      };
+      for (const [left, right] of [
+        [5, 12],
+        [12, 5],
+      ]) {
+        await dragBox({ x: left, y: 50 }, { x: right, y: 40 });
+        assert.equal(
+          await selectedRows(desktop.page),
+          0,
+          "downward partial box excludes the line",
+        );
+        await dragBox({ x: right, y: 40 }, { x: left, y: 50 });
+        assert.equal(
+          await selectedRows(desktop.page),
+          1,
+          "upward partial box includes the crossed line",
+        );
+        assert(
+          await desktop.page
+            .locator(".entity-row")
+            .nth(0)
+            .evaluate((row) => row.classList.contains("selected")),
+        );
+      }
+      await desktop.page.keyboard.down("Control");
+      await dragBox({ x: 32, y: 35 }, { x: 40, y: 55 });
+      await desktop.page.keyboard.up("Control");
+      assert.equal(
+        await selectedRows(desktop.page),
+        2,
+        "Ctrl adds crossed circle without dropping the line",
+      );
+      assert(
+        await desktop.page
+          .locator(".entity-row")
+          .nth(1)
+          .evaluate((row) => row.classList.contains("selected")),
+      );
+      return { downwardPartial: 0, upwardPartial: 1, additiveCrossing: 2 };
+    },
+  );
+  await check(
     "Real control drags edit line and spline geometry; rotated text is pickable",
     async () => {
       const text = (await assertAssets(desktop)).text,

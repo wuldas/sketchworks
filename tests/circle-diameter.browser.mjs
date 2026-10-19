@@ -239,6 +239,171 @@ try {
       return { diameterInches: 3, radiusMillimeters: 38.1 };
     },
   );
+  const cornerLine = (id, coords) => ({
+    id,
+    name: id,
+    kind: "line",
+    points: coords.map(([x, y], index) => ({ id: `${id}-p${index}`, x, y })),
+  });
+  const cornerDoc = fixture();
+  cornerDoc.sketches[0].entities = [
+    cornerLine("top", [
+      [0, 20],
+      [20, 20],
+    ]),
+    cornerLine("left", [
+      [0, 0],
+      [0, 20],
+    ]),
+    cornerLine("bottom", [
+      [20, 0],
+      [0, 0],
+    ]),
+  ];
+  cornerDoc.sketches[0].constraints = [
+    { id: "top-axis", kind: "horizontal", refs: ["top"] },
+    { id: "left-axis", kind: "vertical", refs: ["left"] },
+    { id: "bottom-axis", kind: "horizontal", refs: ["bottom"] },
+    { id: "top-joint", kind: "coincident", refs: ["top-p0", "left-p1"] },
+    { id: "bottom-joint", kind: "coincident", refs: ["left-p0", "bottom-p1"] },
+  ];
+  await check(
+    "Adjacent fillets stay joined and tangent through radius edits, dragging and history",
+    cornerDoc,
+    async (page) => {
+      await page
+        .getByRole("checkbox", { name: "自动约束", exact: true })
+        .uncheck();
+      const row = (id) => page.locator(`.entity-row[title="${id}"]`);
+      const fillet = async (first, second) => {
+        await row(first).click();
+        await row(second).click({ modifiers: ["Control"] });
+        await page.getByRole("button", { name: "圆角", exact: true }).click();
+        const panel = page.getByTestId("parameter-panel");
+        await panel
+          .getByRole("textbox", { name: "半径", exact: true })
+          .fill("3");
+        await panel.locator('button[type="submit"]').click();
+        const confirmation = page.locator(".dialog");
+        await confirmation.waitFor();
+        await confirmation
+          .getByRole("button", { name: "移除约束并修改", exact: true })
+          .click();
+        await panel.waitFor({ state: "detached" });
+      };
+      const connected = (doc) => {
+        const sketch = doc.sketches[0],
+          top = sketch.entities.find((e) => e.id === "top"),
+          left = sketch.entities.find((e) => e.id === "left"),
+          bottom = sketch.entities.find((e) => e.id === "bottom"),
+          arcs = sketch.entities.filter((e) => e.kind === "arc");
+        assert.equal(arcs.length, 2);
+        const pairs = [
+          [top, 0, arcs[0], 1],
+          [left, 1, arcs[0], 2],
+          [left, 0, arcs[1], 1],
+          [bottom, 1, arcs[1], 2],
+        ];
+        const gaps = [];
+        for (const [line, lineEndpoint, arc, arcEndpoint] of pairs) {
+          const point = arc.points[arcEndpoint],
+            center = arc.points[0],
+            end = line.points[lineEndpoint],
+            rx = point.x - center.x,
+            ry = point.y - center.y,
+            dx = line.points[1].x - line.points[0].x,
+            dy = line.points[1].y - line.points[0].y,
+            gap = Math.hypot(point.x - end.x, point.y - end.y),
+            tangent =
+              Math.abs(rx * dx + ry * dy) /
+              (Math.hypot(rx, ry) * Math.hypot(dx, dy));
+          assert(gap < 1e-6, `fillet endpoint separated by ${gap}`);
+          assert(tangent < 1e-6, `fillet lost tangency: ${tangent}`);
+          gaps.push(gap);
+        }
+        assert(Math.abs(top.points[0].y - top.points[1].y) < 1e-6);
+        assert(Math.abs(left.points[0].x - left.points[1].x) < 1e-6);
+        assert(Math.abs(bottom.points[0].y - bottom.points[1].y) < 1e-6);
+        return { arcs, gaps };
+      };
+      await fillet("top", "left");
+      await fillet("left", "bottom");
+      const created = await saved(page);
+      const initial = connected(created),
+        upper = initial.arcs[0];
+      await page
+        .getByRole("combobox", { name: "尺寸类型", exact: true })
+        .selectOption("radius");
+      await page.locator('button[title="草图尺寸 (D)"]').click();
+      await click(page, {
+        x: upper.points[0].x - upper.radius / Math.SQRT2,
+        y: upper.points[0].y + upper.radius / Math.SQRT2,
+      });
+      const input = page.getByTestId("dimension-input");
+      await input.waitFor();
+      await input.fill("5");
+      await input.press("Enter");
+      await input.waitFor({ state: "detached" });
+      const edited = await saved(page),
+        changed = connected(edited);
+      assert(Math.abs(changed.arcs[0].radius - 5) < 1e-6);
+      await page
+        .getByRole("button", { name: "撤销 (Ctrl+Z)", exact: true })
+        .click();
+      assert(Math.abs(connected(await saved(page)).arcs[0].radius - 3) < 1e-6);
+      await page
+        .getByRole("button", { name: "重做 (Ctrl+Shift+Z)", exact: true })
+        .click();
+      assert(Math.abs(connected(await saved(page)).arcs[0].radius - 5) < 1e-6);
+      await page.keyboard.press("Escape");
+      await page.getByRole("button", { name: "选择", exact: true }).click();
+      await page.getByRole("checkbox", { name: "吸附", exact: true }).uncheck();
+      const beforeDrag = await saved(page),
+        lower = connected(beforeDrag).arcs[1],
+        canvas = page.getByTestId("cad-canvas"),
+        box = await canvas.boundingBox(),
+        handle = (await state(page)).handles.find(
+          (p) => p.pointId === lower.points[1].id,
+        );
+      await page.mouse.move(box.x + handle.x, box.y + handle.y);
+      await page.mouse.down();
+      await page.mouse.move(box.x + handle.x, box.y + handle.y - 15, {
+        steps: 6,
+      });
+      await page.mouse.up();
+      const dragged = await saved(page),
+        afterDrag = connected(dragged);
+      const draggedPoint = afterDrag.arcs[1].points[1],
+        beforePoint = lower.points[1];
+      assert(
+        Math.hypot(
+          draggedPoint.x - beforePoint.x,
+          draggedPoint.y - beforePoint.y,
+        ) > 1e-3,
+        "connected endpoint really moved",
+      );
+      await page
+        .getByRole("button", { name: "撤销 (Ctrl+Z)", exact: true })
+        .click();
+      assert.deepEqual(await saved(page), beforeDrag);
+      await page
+        .getByRole("button", { name: "重做 (Ctrl+Shift+Z)", exact: true })
+        .click();
+      connected(await saved(page));
+      await page.reload();
+      await page.locator(".loading-overlay").waitFor({ state: "hidden" });
+      connected(await saved(page));
+      await page.screenshot({
+        path: path.join(output, "connected-fillet-radius.png"),
+      });
+      return {
+        initialGaps: initial.gaps,
+        resizedGaps: changed.gaps,
+        draggedGaps: afterDrag.gaps,
+        radius: changed.arcs[0].radius,
+      };
+    },
+  );
   assert.deepEqual(results.errors, []);
   results.passed = results.checks.every((c) => c.passed);
   if (!results.passed) process.exitCode = 1;

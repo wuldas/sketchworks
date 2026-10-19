@@ -523,6 +523,69 @@ describe("retained Canvas renderer", () => {
     expect(r.snap({ x: 45, y: 35 }, frame())).toBeNull();
     expect(r.snap({ x: 40, y: 30 }, frame({ grid: false }))).toBeNull();
   });
+  it("uses vertical box direction for containment versus crossing regardless of horizontal direction", () => {
+    const line = entity("line", [
+        { x: 0, y: 0 },
+        { x: 20, y: 0 },
+      ]),
+      r = new CanvasRenderer();
+    r.sync([sketch([line])], "s1");
+    for (const [left, right] of [
+      [5, 15],
+      [15, 5],
+    ]) {
+      expect(r.selectBox({ x: left, y: 2 }, { x: right, y: -2 })).toEqual([]);
+      expect(r.selectBox({ x: left, y: -2 }, { x: right, y: 2 })).toEqual([
+        line.id,
+      ]);
+    }
+    expect(r.selectBox({ x: -1, y: 2 }, { x: 21, y: -2 })).toEqual([line.id]);
+    expect(r.selectBox({ x: 5, y: 0 }, { x: 15, y: 0 })).toEqual([]);
+  });
+  it("crosses actual circle ink including tangent contact, not empty bounds or the circle interior", () => {
+    const circle = entity("circle", [{ x: 0, y: 0 }], { radius: 10 }),
+      r = new CanvasRenderer();
+    r.sync([sketch([circle])], "s1");
+    expect(r.selectBox({ x: 9, y: -1 }, { x: 11, y: 1 })).toEqual([circle.id]);
+    expect(r.selectBox({ x: 10, y: -1 }, { x: 12, y: 1 })).toEqual([circle.id]);
+    expect(r.selectBox({ x: 8.5, y: 8.5 }, { x: 9.5, y: 9.5 })).toEqual([]);
+    expect(r.selectBox({ x: -1, y: -1 }, { x: 1, y: 1 })).toEqual([]);
+  });
+  it("crosses curve segments without selecting control handles or inactive and hidden sketches", () => {
+    const curve = entity("bezier", [
+        { x: 0, y: 0 },
+        { x: 4, y: 10 },
+        { x: 6, y: -10 },
+        { x: 10, y: 0 },
+      ]),
+      r = new CanvasRenderer();
+    r.sync(
+      [
+        sketch([curve]),
+        sketch(
+          [
+            entity("line", [
+              { x: 4, y: -3 },
+              { x: 4, y: 3 },
+            ]),
+          ],
+          { id: "inactive" },
+        ),
+        sketch(
+          [
+            entity("line", [
+              { x: 6, y: -3 },
+              { x: 6, y: 3 },
+            ]),
+          ],
+          { id: "hidden", visible: false },
+        ),
+      ],
+      "s1",
+    );
+    expect(r.selectBox({ x: 4, y: -1 }, { x: 6, y: 1 })).toEqual([curve.id]);
+    expect(r.selectBox({ x: 3, y: 8 }, { x: 5, y: 10 })).toEqual([]);
+  });
   it("selects an arc by actual curve bounds rather than its invisible full circle", () => {
     const e = entity(
         "arc",
@@ -535,7 +598,7 @@ describe("retained Canvas renderer", () => {
       ),
       r = new CanvasRenderer();
     r.sync([sketch([e])], "s1");
-    expect(r.selectBox({ x: -0.01, y: -0.01 }, { x: 20.01, y: 20.01 })).toEqual(
+    expect(r.selectBox({ x: -0.01, y: 20.01 }, { x: 20.01, y: -0.01 })).toEqual(
       [e.id],
     );
   });
@@ -548,7 +611,7 @@ describe("retained Canvas renderer", () => {
       ]),
       r = new CanvasRenderer();
     r.sync([sketch([e])], "s1");
-    expect(r.selectBox({ x: -0.1, y: -3 }, { x: 10.1, y: 3 })).toEqual([e.id]);
+    expect(r.selectBox({ x: -0.1, y: 3 }, { x: 10.1, y: -3 })).toEqual([e.id]);
   });
   it("retains native paths across cloned documents and prunes removed paths", () => {
     vi.stubGlobal("Path2D", FakePath);

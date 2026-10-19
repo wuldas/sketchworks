@@ -105,6 +105,18 @@ async function settle(session) {
       ),
   );
 }
+async function disableGrid(session) {
+  await session.page
+    .getByRole("checkbox", { name: "网格", exact: true })
+    .uncheck();
+  const capture = session.page.getByRole("button", {
+    name: "网格捕获",
+    exact: true,
+  });
+  if ((await capture.getAttribute("aria-pressed")) === "true")
+    await capture.click();
+  await settle(session);
+}
 async function screen(session, point) {
   const info = await session.metadata(),
     box = await session.canvas.boundingBox();
@@ -239,6 +251,12 @@ try {
         finish = await screen(session, target);
       await session.page.mouse.move(start.x, start.y);
       await session.page.mouse.down();
+      await settle(session);
+      assert.equal(
+        (await session.metadata()).snap,
+        null,
+        "a click without movement does not capture",
+      );
       await session.page.mouse.move(finish.x + 2, finish.y + 1, { steps: 8 });
       await settle(session);
       const captured = await session.metadata(),
@@ -252,6 +270,12 @@ try {
         "rendered anchor must be at the capture cue",
       );
       await session.page.mouse.up();
+      await settle(session);
+      assert.equal(
+        (await session.metadata()).snap,
+        null,
+        "release clears the capture cue",
+      );
       close(pointOf(await saved(session), "point"), target);
       await session.page
         .getByRole("button", { name: "撤销 (Ctrl+Z)", exact: true })
@@ -440,10 +464,7 @@ try {
     "Constraint-connected moving peer points do not make dragging stall",
     document(rectangle, rectangleConstraints),
     async (session) => {
-      await session.page
-        .getByRole("checkbox", { name: "网格", exact: true })
-        .uncheck();
-      await settle(session);
+      await disableGrid(session);
       const start = await screen(session, { x: 20.3, y: 20.3 }),
         initial = await session.metadata(),
         samples = [];
@@ -491,9 +512,7 @@ try {
       ],
     ),
     async (session) => {
-      await session.page
-        .getByRole("checkbox", { name: "网格", exact: true })
-        .uncheck();
+      await disableGrid(session);
       await session.page.locator(".entity-row").nth(1).click();
       await session.page
         .locator(".entity-row")
