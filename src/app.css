@@ -153,7 +153,7 @@ a {
   font-size: 11px;
   color: #91989e;
 }
-.license-link {
+.header-link {
   color: #8c969b;
   height: 24px;
   display: flex;
@@ -1498,7 +1498,7 @@ a {
   .brand-tag,
   .document-title > svg,
   .save-dot,
-  .license-link {
+  .header-link {
     display: none;
   }
   .brand {

@@ -57,6 +57,7 @@ import {
   CircleDashed,
   GitBranch,
   CircleHelp,
+  Github,
   Tangent,
   AlignHorizontalDistributeCenter,
   AlignVerticalDistributeCenter,
@@ -2091,13 +2092,23 @@ export default function App() {
             onClick={() => openFileManager("browse")}
           />
           <a
-            className="license-link"
-            href="/THIRD_PARTY_NOTICES.txt"
+            className="header-link"
+            href={`${import.meta.env.BASE_URL}THIRD_PARTY_NOTICES.txt`}
             target="_blank"
             title="第三方许可"
             aria-label="第三方许可"
           >
             <CircleHelp size={16} />
+          </a>
+          <a
+            className="header-link"
+            href="https://github.com/wuldas/sketchworks"
+            target="_blank"
+            rel="noreferrer"
+            title="GitHub 项目主页"
+            aria-label="GitHub 项目主页"
+          >
+            <Github size={16} />
           </a>
           <button
             className="export-button"
