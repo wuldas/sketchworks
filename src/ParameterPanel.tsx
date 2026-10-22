@@ -117,7 +117,7 @@ export function ParameterPanel({
                   const pointIndex =
                     e?.points.findIndex((point) => point.id === s.pointId) ??
                     -1;
-                  const name = `${e?.name ?? "对象"}${s.pointId ? ` · 点 ${pointIndex + 1}` : ""}`;
+                  const name = `${e?.name ?? "对象"}${s.pointId ? (e?.kind === "circle" && pointIndex === 0 ? " · 圆心" : ` · 点 ${pointIndex + 1}`) : ""}`;
                   return (
                     <button
                       type="button"

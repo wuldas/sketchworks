@@ -238,6 +238,152 @@ const openCommand = async (menu, label) => {
 };
 const selectedRows = () => page.locator(".entity-row.selected").count();
 
+const circleFixture = {
+  ...fixture,
+  name: "圆心点约束",
+  sketches: [
+    {
+      id: "circle-point-sketch",
+      name: "圆心点约束",
+      visible: true,
+      entities: [
+        entity("circle", "circle-a", [[-25, 10]], { radius: 6 }),
+        entity("circle", "circle-b", [[10, -10]], { radius: 4 }),
+        entity("point", "anchor", [[-5, 25]]),
+        line("fixed-axis", [
+          [-45, -15],
+          [40, -15],
+        ]),
+      ],
+      constraints: [
+        { id: "radius-a", kind: "radius", refs: ["circle-a"], value: 6 },
+        { id: "radius-b", kind: "radius", refs: ["circle-b"], value: 4 },
+        { id: "anchor-fixed", kind: "fixed", refs: ["anchor"] },
+        { id: "axis-fixed", kind: "fixed", refs: ["fixed-axis"] },
+      ],
+    },
+  ],
+};
+async function circleConstraintCheck(name, run) {
+  await check(name, async () => {
+    const isolated = await browser.newContext({
+      viewport: { width: 1440, height: 900 },
+    });
+    try {
+      await isolated.addInitScript(
+        ([key, doc]) => {
+          if (!sessionStorage.getItem("circle-constraint-seeded")) {
+            localStorage.setItem(key, JSON.stringify(doc));
+            sessionStorage.setItem("circle-constraint-seeded", "true");
+          }
+        },
+        [storageKey, circleFixture],
+      );
+      const current = await isolated.newPage();
+      current.on("pageerror", (error) =>
+        results.pageErrors.push(error.message),
+      );
+      current.on("console", (message) => {
+        if (
+          message.type() === "error" &&
+          !message.location().url.endsWith("/favicon.ico")
+        )
+          results.consoleErrors.push(message.text());
+      });
+      await current.goto(url);
+      await current.locator(".loading-overlay").waitFor({ state: "hidden" });
+      const projects = current.locator(
+        '.app-header button[aria-label="项目管理"]',
+      );
+      await current.waitForFunction(() => {
+        const b = document.querySelector(
+          '.app-header button[aria-label="项目管理"]',
+        );
+        return b && !b.disabled;
+      });
+      if ((await projects.getAttribute("aria-pressed")) === "true")
+        await projects.click();
+      await current.locator('.view-controls button[title="适配全部"]').click();
+      await current.evaluate(
+        () =>
+          new Promise((resolve) =>
+            requestAnimationFrame(() => requestAnimationFrame(resolve)),
+          ),
+      );
+      const surface = current.getByTestId("cad-canvas"),
+        parameters = current.getByTestId("parameter-panel");
+      const frameReady = () =>
+        current.waitForFunction(() => {
+          const c = document.querySelector('[data-testid="cad-canvas"]'),
+            s = c?.__cadViewport,
+            b = c?.getBoundingClientRect();
+          return (
+            s &&
+            b &&
+            Math.abs(s.width - b.width) < 1 &&
+            Math.abs(s.height - b.height) < 1
+          );
+        });
+      const click = async (world) => {
+        await frameReady();
+        const state = await surface.evaluate((el) => el.__cadViewport),
+          box = await surface.boundingBox();
+        const screen = {
+          x: box.x + state.origin.x + world.x * state.scale,
+          y: box.y + state.origin.y - world.y * state.scale,
+        };
+        assert.equal(
+          await current.evaluate(
+            ({ x, y }) => document.elementFromPoint(x, y)?.tagName,
+            screen,
+          ),
+          "CANVAS",
+        );
+        await current.mouse.click(screen.x, screen.y);
+      };
+      const start = async (label) => {
+        await current
+          .locator(`.constraint-grid button[title=${JSON.stringify(label)}]`)
+          .click();
+        await parameters.waitFor();
+      };
+      const read = () =>
+        current.evaluate(
+          (key) => JSON.parse(localStorage.getItem(key)).sketches[0],
+          storageKey,
+        );
+      const commit = async (kind) => {
+        assert.equal(
+          await parameters.locator('button[type="submit"]').isDisabled(),
+          false,
+        );
+        await parameters.locator('button[type="submit"]').click();
+        await parameters.waitFor({ state: "detached" });
+        await current.waitForFunction(
+          ({ key, kind }) =>
+            JSON.parse(localStorage.getItem(key)).sketches[0].constraints.some(
+              (c) => c.kind === kind,
+            ),
+          { key: storageKey, kind },
+        );
+        await current.locator('.save-dot[data-saved="true"]').waitFor();
+        return read();
+      };
+      await frameReady();
+      return await run({
+        page: current,
+        panel: parameters,
+        click,
+        start,
+        commit,
+        read,
+      });
+    } finally {
+      await isolated.close();
+    }
+  });
+}
+
 await page.goto(url, { waitUntil: "networkidle" });
 await page.waitForFunction(
   () =>
@@ -245,6 +391,13 @@ await page.waitForFunction(
       ?.renderer === "canvas2d",
 );
 await page.waitForFunction(() => !document.querySelector(".loading-overlay"));
+// The project browser is independent of the command-under-test; give the
+// fixture enough drawing width so its circle is not behind the parameter panel.
+const projectToggle = page.locator('.app-header button[aria-label="项目管理"]');
+await projectToggle.waitFor({ state: "visible" });
+if ((await projectToggle.getAttribute("aria-pressed")) === "true")
+  await projectToggle.click();
+await stableViewport();
 
 /* ------------------------------------------------------------- constraint */
 await check(
@@ -538,6 +691,108 @@ await check(
     assert.equal(await selectedRows(), 0);
     assert.equal(await page.locator(".empty-selection").count(), 1);
     return { cleared: true };
+  },
+);
+
+await circleConstraintCheck(
+  "a preselected circle is a native center point for coincidence and survives reload",
+  async (s) => {
+    await s.click({ x: -31, y: 10 });
+    await s.start("重合");
+    assert.equal(
+      await s.panel
+        .locator('[data-parameter="first"] .geometry-selection-list button')
+        .count(),
+      1,
+    );
+    await s.click({ x: -25, y: 10 });
+    assert.equal(
+      await s.panel
+        .locator('[data-parameter="second"] .geometry-selection-list button')
+        .count(),
+      0,
+      "the body and center handle cannot fill both point inputs",
+    );
+    await s.page.screenshot({
+      path: path.join(output, "circle-center-selection.png"),
+      scale: "css",
+    });
+    await s.click({ x: -5, y: 25 });
+    const sketch = await s.commit("coincident"),
+      circle = sketch.entities.find((e) => e.id === "circle-a"),
+      constraint = sketch.constraints.find((c) => c.kind === "coincident");
+    assert.deepEqual(constraint.refs, ["circle-a_p0", "anchor_p0"]);
+    assert(Math.hypot(circle.points[0].x + 5, circle.points[0].y - 25) < 1e-6);
+    assert(Math.abs(circle.radius - 6) < 1e-6);
+    assert.equal(sketch.entities.length, 4);
+    await s.page.reload();
+    await s.page.locator(".loading-overlay").waitFor({ state: "hidden" });
+    const restored = await s.read();
+    assert.deepEqual(
+      restored.constraints.find((c) => c.kind === "coincident").refs,
+      constraint.refs,
+    );
+    return {
+      refs: constraint.refs,
+      center: circle.points[0],
+      radius: circle.radius,
+    };
+  },
+);
+await circleConstraintCheck(
+  "horizontal alignment accepts two circle bodies and only aligns their centers",
+  async (s) => {
+    await s.start("水平");
+    await s.click({ x: -31, y: 10 });
+    await s.click({ x: 6, y: -10 });
+    const sketch = await s.commit("horizontal"),
+      a = sketch.entities.find((e) => e.id === "circle-a"),
+      b = sketch.entities.find((e) => e.id === "circle-b");
+    assert.deepEqual(
+      sketch.constraints.find((c) => c.kind === "horizontal").refs,
+      ["circle-a_p0", "circle-b_p0"],
+    );
+    assert(Math.abs(a.points[0].y - b.points[0].y) < 1e-6);
+    assert(
+      Math.abs(a.points[0].x + 25) < 1e-6 &&
+        Math.abs(b.points[0].x - 10) < 1e-6,
+    );
+    assert(Math.abs(a.radius - 6) < 1e-6 && Math.abs(b.radius - 4) < 1e-6);
+    return { centers: [a.points[0], b.points[0]] };
+  },
+);
+await circleConstraintCheck(
+  "point-on-line constrains the selected circle center rather than its circumference",
+  async (s) => {
+    await s.start("点在线上");
+    await s.click({ x: -31, y: 10 });
+    await s.click({ x: -30, y: -15 });
+    const sketch = await s.commit("onLine"),
+      circle = sketch.entities.find((e) => e.id === "circle-a");
+    assert.deepEqual(sketch.constraints.find((c) => c.kind === "onLine").refs, [
+      "circle-a_p0",
+      "fixed-axis",
+    ]);
+    assert(Math.abs(circle.points[0].y + 15) < 1e-6);
+    assert(Math.abs(circle.radius - 6) < 1e-6);
+    return { center: circle.points[0], radius: circle.radius };
+  },
+);
+await circleConstraintCheck(
+  "tangency still uses the complete circle instead of converting it to a point",
+  async (s) => {
+    await s.start("相切");
+    await s.click({ x: -31, y: 10 });
+    await s.click({ x: -30, y: -15 });
+    const sketch = await s.commit("tangent"),
+      circle = sketch.entities.find((e) => e.id === "circle-a");
+    assert.deepEqual(
+      sketch.constraints.find((c) => c.kind === "tangent").refs,
+      ["circle-a", "fixed-axis"],
+    );
+    assert(Math.abs(Math.abs(circle.points[0].y + 15) - 6) < 1e-6);
+    assert(Math.abs(circle.radius - 6) < 1e-6);
+    return { center: circle.points[0], radius: circle.radius };
   },
 );
 

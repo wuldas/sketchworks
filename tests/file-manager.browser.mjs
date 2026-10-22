@@ -7,7 +7,7 @@ import path from "node:path";
 import { existsSync } from "node:fs";
 import { gunzipSync } from "node:zlib";
 
-// Run only after App has integrated FileManager and the existing dev server is stable.
+// Real project sidebar, local file storage, and archive/attachment interactions.
 const url = process.env.CAD_URL || "http://127.0.0.1:5173";
 const output = path.resolve(
   process.env.CAD_FILE_ARTIFACTS || "artifacts/file-manager",
@@ -58,11 +58,19 @@ const idle = async (manager) => {
   });
 };
 async function openManager(page) {
-  await button(page.locator(".app-header"), "文件管理器").click();
+  const toggle = button(page.locator(".app-header"), "项目管理");
+  if ((await toggle.getAttribute("aria-pressed")) !== "true")
+    await toggle.click();
   const manager = page.getByTestId("file-manager");
   await expect(manager).toBeVisible();
   await idle(manager);
   return manager;
+}
+async function closeManager(page) {
+  const toggle = button(page.locator(".app-header"), "项目管理");
+  if ((await toggle.getAttribute("aria-pressed")) === "true")
+    await toggle.click();
+  await expect(page.getByTestId("file-manager")).toBeHidden();
 }
 async function createFolder(manager, name) {
   await button(manager, "新建文件夹").click();
@@ -73,8 +81,8 @@ async function createFolder(manager, name) {
   await idle(manager);
   await expect(entry(manager, name)).toBeVisible();
 }
-async function saveCurrent(manager, name) {
-  await button(manager, "保存当前项目").click();
+async function saveCurrent(page, manager, name) {
+  await button(page.locator(".workspace-tabbar"), "保存当前项目").click();
   await manager
     .getByRole("textbox", { name: "项目文件名", exact: true })
     .fill(name);
@@ -195,7 +203,7 @@ const checks = [
       let manager = await openManager(page);
       await createFolder(manager, "工程目录");
       await createFolder(manager, "归档目录");
-      await saveCurrent(manager, "z 文件");
+      await saveCurrent(page, manager, "z 文件");
       const ordered = await manager
         .getByTestId("file-manager-entry")
         .evaluateAll((rows) => rows.map((row) => row.dataset.entryKind));
@@ -226,7 +234,7 @@ const checks = [
           .getAttribute("data-entry-kind"),
         "folder",
       );
-      await button(manager, "关闭文件管理器").click();
+      await closeManager(page);
       await page.reload({ waitUntil: "networkidle" });
       manager = await openManager(page);
       await expect(entry(manager, "工程目录")).toBeVisible();
@@ -248,17 +256,12 @@ const checks = [
         .getByRole("textbox", { name: "项目文件名" })
         .fill("正式项目");
       await button(manager, "保存").click();
-      await expect(manager).toBeHidden();
+      await expect(manager).toHaveAttribute("data-mode", "browse");
       const file = await fileByName(page, "正式项目.swcad");
       assert.deepEqual(
         (await projectState(page, file.id)).document.sketches,
         seed.sketches,
       );
-      await page
-        .getByRole("textbox", { name: "文档名称", exact: true })
-        .fill("编辑中的项目");
-      await page.getByRole("textbox", { name: "文档名称", exact: true }).blur();
-      await expect(page.locator('.save-dot[data-saved="true"]')).toBeVisible();
       await page.keyboard.press("Control+Shift+s");
       manager = page.getByTestId("file-manager");
       await idle(manager);
@@ -272,11 +275,11 @@ const checks = [
       await button(manager, "保存").click();
       await expect(button(manager, "覆盖并保存")).toBeVisible();
       await button(manager, "覆盖并保存").click();
-      await expect(manager).toBeHidden();
+      await expect(manager).toHaveAttribute("data-mode", "browse");
       assert.equal((await fileByName(page, "正式项目.swcad")).id, file.id);
       assert.equal(
         (await projectState(page, file.id)).document.name,
-        "编辑中的项目",
+        seed.name,
       );
       await page.keyboard.press("Control+Shift+s");
       manager = page.getByTestId("file-manager");
@@ -295,24 +298,19 @@ const checks = [
     name: "browse save activates link, CtrlS saves IDB and JSON export preserves editor",
     run: async (page) => {
       const manager = await openManager(page);
-      const name = await saveCurrent(manager, "当前编辑");
+      const name = await saveCurrent(page, manager, "当前编辑");
       await expect(entry(manager, name)).toContainText("当前");
-      await button(manager, "关闭文件管理器").click();
+      await closeManager(page);
       const exported = await downloadedJson(page, "browse-editor");
       assert.deepEqual(exported.sketches, seed.sketches);
       assert.equal(exported.name, seed.name);
       const file = await fileByName(page, name);
       assert.deepEqual((await projectState(page, file.id)).document, seed);
 
-      const documentName = page.getByRole("textbox", {
-        name: "文档名称",
-        exact: true,
-      });
-      await documentName.fill("CtrlS 保存后的项目");
-      await documentName.blur();
       const downloads = [];
       const trackDownload = (download) =>
         downloads.push(download.suggestedFilename());
+      await page.getByRole("combobox", { name: "单位" }).selectOption("in");
       page.on("download", trackDownload);
       await page.keyboard.press("Control+s");
       await expect(page.getByText("项目已保存", { exact: true })).toBeVisible();
@@ -325,7 +323,8 @@ const checks = [
       page.off("download", trackDownload);
       assert.equal((await fileByName(page, name)).id, file.id);
       const saved = await projectState(page, file.id);
-      assert.equal(saved.document.name, "CtrlS 保存后的项目");
+      assert.equal(saved.document.name, seed.name);
+      assert.equal(saved.document.unit, "in");
       assert.deepEqual(saved.document.sketches, seed.sketches);
       const explicitJson = await downloadedJson(
         page,
@@ -374,9 +373,9 @@ const checks = [
       await expect(
         manager.getByRole("alert").filter({ hasText: "打开项目失败" }),
       ).toBeVisible();
-      await expect(
-        page.getByRole("textbox", { name: "文档名称", exact: true }),
-      ).toHaveValue(seed.name);
+      await expect(page.locator(".app-header .document-name")).toHaveText(
+        seed.name,
+      );
       await button(manager, "关闭错误提示").click();
       await page.evaluate(
         async ({ id, bytes }) => {
@@ -389,10 +388,10 @@ const checks = [
         { id: imported.id, bytes: Array.from(payload.buffer) },
       );
       await entry(manager, payload.name).dblclick();
-      await expect(manager).toBeHidden();
-      await expect(
-        page.getByRole("textbox", { name: "文档名称", exact: true }),
-      ).toHaveValue("要打开的项目");
+      await expect(manager).toBeVisible();
+      await expect(page.locator(".app-header .document-name")).toHaveText(
+        "要打开的项目",
+      );
       assert.equal(
         (await downloadedJson(page, "opened-project")).sketches[0].entities[0]
           .id,
@@ -405,7 +404,7 @@ const checks = [
     run: async (page) => {
       const manager = await openManager(page);
       await createFolder(manager, "目标目录");
-      await saveCurrent(manager, "改名前");
+      await saveCurrent(page, manager, "改名前");
       const original = await fileByName(page, "改名前.swcad");
       await entry(manager, "改名前.swcad").click();
       await button(manager, "重命名").click();
@@ -426,7 +425,7 @@ const checks = [
       await idle(manager);
       await expect(entry(manager, "改名后.swcad")).toContainText("当前");
       assert.equal((await fileByName(page, "改名后.swcad")).id, original.id);
-      await button(manager, "关闭文件管理器").click();
+      await closeManager(page);
       const header = await page.locator(".app-header").innerText();
       assert(
         header.includes("改名后") ||
@@ -448,7 +447,7 @@ const checks = [
       await createFolder(manager, "源目录");
       await entry(manager, "源目录").dblclick();
       await idle(manager);
-      await saveCurrent(manager, "源项目");
+      await saveCurrent(page, manager, "源项目");
       const original = await fileByName(page, "源项目.swcad");
       await button(manager, "复制").click();
       await manager
@@ -491,7 +490,7 @@ const checks = [
       await createFolder(manager, "待删除目录");
       await entry(manager, "待删除目录").dblclick();
       await idle(manager);
-      await saveCurrent(manager, "待删除文件");
+      await saveCurrent(page, manager, "待删除文件");
       await entry(manager, "待删除文件.swcad").focus();
       await page.keyboard.press("Control+a");
       await page.keyboard.press("Delete");
@@ -507,7 +506,7 @@ const checks = [
       await button(manager, "确认删除").click();
       await idle(manager);
       assert.equal((await allEntries(page)).length, 0);
-      await button(manager, "关闭文件管理器").click();
+      await closeManager(page);
       assert.deepEqual(
         (await downloadedJson(page, "deleted-active-editor")).sketches,
         seed.sketches,
@@ -579,17 +578,17 @@ const checks = [
       assert.equal(doc.name, "归档导入");
       assert.deepEqual(doc.sketches, seed.sketches);
       await entry(manager, "旧版导入.swcad").dblclick();
-      await expect(manager).toBeHidden();
-      await expect(
-        page.getByRole("textbox", { name: "文档名称", exact: true }),
-      ).toHaveValue("旧版导入");
+      await expect(manager).toBeVisible();
+      await expect(page.locator(".app-header .document-name")).toHaveText(
+        "旧版导入",
+      );
     },
   },
   {
     name: "active image attachments use current geometry and persist exact bytes",
     run: async (page) => {
       let manager = await openManager(page);
-      await saveCurrent(manager, "图片项目");
+      await saveCurrent(page, manager, "图片项目");
       const file = await fileByName(page, "图片项目.swcad");
       const oldBytes = await page.evaluate(async (id) => {
         const { virtualFiles } = await import("/src/virtualFileSystem.ts");
@@ -597,16 +596,19 @@ const checks = [
           new Uint8Array(await (await virtualFiles.readFile(id)).arrayBuffer()),
         );
       }, file.id);
-      await button(manager, "关闭文件管理器").click();
+      await closeManager(page);
       await button(page, "直线").first().click();
+      await page.getByTestId("creation-panel").waitFor();
       const canvas = page.getByTestId("cad-canvas");
       const box = await canvas.boundingBox();
       assert(box);
+      const before = await page.locator(".entity-row").count();
       await page.mouse.click(box.x + box.width * 0.3, box.y + box.height * 0.3);
       await page.mouse.click(
         box.x + box.width * 0.55,
         box.y + box.height * 0.45,
       );
+      await expect(page.locator(".entity-row")).toHaveCount(before + 1);
       await page.keyboard.press("Escape");
       await expect(page.locator('.save-dot[data-saved="true"]')).toBeVisible();
       const edited = await downloadedJson(page, "edited-before-attachment");
@@ -637,7 +639,7 @@ const checks = [
       const state = await projectState(page, file.id);
       assert.deepEqual(state.document.sketches, edited.sketches);
       assert.deepEqual(state.attachments[0].bytes, Array.from(image.buffer));
-      await button(manager, "关闭文件管理器").click();
+      await closeManager(page);
       await page.reload({ waitUntil: "networkidle" });
       manager = await openManager(page);
       await entry(manager, "图片项目.swcad").click();
@@ -712,12 +714,8 @@ const checks = [
         left: element.getBoundingClientRect().left,
         width: window.innerWidth,
         documentWidth: document.documentElement.scrollWidth,
-        dialogWidth: element.clientWidth,
-        dialogScrollWidth: element.scrollWidth,
-        rowHeights: Array.from(
-          element.querySelectorAll(".fm-entry"),
-          (row) => row.getBoundingClientRect().height,
-        ),
+        panelWidth: element.clientWidth,
+        panelScrollWidth: element.scrollWidth,
         rowsInside: Array.from(
           element.querySelectorAll(".fm-entry"),
           (row) =>
@@ -727,11 +725,10 @@ const checks = [
       }));
       assert(dimensions.left >= 0 && dimensions.right <= dimensions.width);
       assert(dimensions.documentWidth <= dimensions.width);
-      assert(dimensions.dialogScrollWidth <= dimensions.dialogWidth);
+      assert(dimensions.panelScrollWidth <= dimensions.panelWidth);
       assert(dimensions.rowsInside.every(Boolean));
-      assert(dimensions.rowHeights.every((height) => height === 40));
       await manager.screenshot({ path: path.join(output, "mobile-390.png") });
-      await button(manager, "关闭文件管理器").click();
+      await closeManager(page);
       const exported = await downloadedJson(page, "inactive-attachment-editor");
       assert.deepEqual(
         exported,
@@ -776,7 +773,7 @@ try {
     try {
       await page.goto(url, { waitUntil: "networkidle" });
       await expect(
-        button(page.locator(".app-header"), "文件管理器"),
+        button(page.locator(".app-header"), "项目管理"),
       ).toBeEnabled();
       await check.run(page);
       assert.deepEqual(errors, []);

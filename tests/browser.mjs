@@ -76,6 +76,25 @@ const saved = async () => {
   await page.locator('.save-dot[data-saved="true"]').waitFor();
   return doc();
 };
+// The drawing sidebar replaces the properties panel while a tool collects
+// points, so canvas boxes are only measured once that layout is live.
+const creationStarted = () => page.getByTestId("creation-panel").waitFor();
+// Fixed-count tools commit the final canvas pick without a confirm button;
+// Escape waits until the persisted sketch really contains the new geometry.
+const commitCount = (expected) =>
+  page.waitForFunction(
+    ({ key, expected }) => {
+      const parsed = JSON.parse(localStorage.getItem(key) ?? "null");
+      return (
+        (parsed?.sketches ?? []).reduce(
+          (total, sketch) => total + sketch.entities.length,
+          0,
+        ) >= expected
+      );
+    },
+    { key: storage, expected },
+    { timeout: 20000 },
+  );
 const canvas = page.getByTestId("cad-canvas");
 const compactCanvasOverlays = async () => {
   const controls = await page.locator(".view-controls").boundingBox();
@@ -551,18 +570,24 @@ try {
     assert.equal(geometry(await saved()).entities.length, 0);
     await page.getByRole("checkbox", { name: "吸附", exact: true }).uncheck();
     await button("两点矩形").click();
+    await creationStarted();
     await clickAt(0.2, 0.3);
     await clickAt(0.48, 0.65);
+    await commitCount(4);
     await page.keyboard.press("Escape");
     assert.equal(geometry(await saved()).entities.length, 4);
     await button("圆心圆").click();
-    await clickAt(0.72, 0.45);
-    await clickAt(0.81, 0.45);
+    await creationStarted();
+    await clickAt(0.2, 0.72);
+    await clickAt(0.36, 0.72);
+    await commitCount(5);
     await page.keyboard.press("Escape");
     assert.equal(geometry(await saved()).entities.length, 5);
     await button("直线").click();
-    await clickAt(0.56, 0.78);
-    await clickAt(0.85, 0.78);
+    await creationStarted();
+    await clickAt(0.16, 0.84);
+    await clickAt(0.45, 0.84);
+    await commitCount(6);
     await page.keyboard.press("Escape");
     const sk = geometry(await saved());
     assert.equal(sk.entities.length, 6);
@@ -726,7 +751,7 @@ try {
       "reloading shows only saved dimensions",
     );
     await page
-      .locator("input[type=file]")
+      .locator('.app > input[type="file"]')
       .setInputFiles(path.join(output, "document.sketch.json"));
     assert.equal(geometry(await saved()).entities.length, 6);
   });
@@ -780,10 +805,10 @@ try {
     await page.setViewportSize({ width: 390, height: 844 });
     await page.reload();
     await page.locator(".loading-overlay").waitFor({ state: "hidden" });
-    await button("切换浏览器").click();
+    await button("切换左侧栏").click();
     assert(await page.locator(".browser-panel").isVisible());
     await selectEntity(4);
-    await button("切换浏览器").click();
+    await button("切换左侧栏").click();
     await button("切换属性面板").click();
     assert(
       await page

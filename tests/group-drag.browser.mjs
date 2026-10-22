@@ -511,6 +511,11 @@ async function open(fixture, { dpr = 1 } = {}) {
         .frames > 0,
   );
   const canvas = page.getByTestId("cad-canvas");
+  const projectToggle = page.locator(
+    '.app-header button[aria-label="项目管理"]',
+  );
+  if ((await projectToggle.getAttribute("aria-pressed")) === "true")
+    await projectToggle.click();
   return {
     context,
     page,
@@ -537,6 +542,30 @@ async function saved(session) {
     storage,
   );
 }
+// Fixed-count tools commit the final canvas pick without a confirm button;
+// Escape waits until the persisted sketch really contains the new geometry.
+const entityCount = (session) =>
+  session.page.evaluate((key) => {
+    const parsed = JSON.parse(localStorage.getItem(key) ?? "null");
+    return (parsed?.sketches ?? []).reduce(
+      (total, sketch) => total + sketch.entities.length,
+      0,
+    );
+  }, storage);
+const commitEntities = (session, expected) =>
+  session.page.waitForFunction(
+    ({ key, expected }) => {
+      const parsed = JSON.parse(localStorage.getItem(key) ?? "null");
+      return (
+        (parsed?.sketches ?? []).reduce(
+          (total, sketch) => total + sketch.entities.length,
+          0,
+        ) >= expected
+      );
+    },
+    { key: storage, expected },
+    { timeout: 20000 },
+  );
 async function screen(session, point) {
   const info = await session.metadata(),
     box = await session.canvas.boundingBox();
@@ -987,8 +1016,11 @@ async function exercise(
     await session.page
       .getByRole("checkbox", { name: "\u7f51\u683c", exact: true })
       .uncheck();
-    const gridCapture = session.page.locator(".bottom-actions").getByRole("button", { name: "\u7f51\u683c\u6355\u83b7", exact: true });
-    if ((await gridCapture.getAttribute("aria-pressed")) === "true") await gridCapture.click();
+    const gridCapture = session.page
+      .locator(".bottom-actions")
+      .getByRole("button", { name: "\u7f51\u683c\u6355\u83b7", exact: true });
+    if ((await gridCapture.getAttribute("aria-pressed")) === "true")
+      await gridCapture.click();
   }
   if (!grid && !endpoint)
     await session.page
@@ -1242,11 +1274,15 @@ async function check(name, fixture, spec, options = {}) {
               { x: -2.3, y: 20.7 },
               { x: -2.3, y: 24.7 },
             ];
+      const before = await entityCount(session);
       for (const point of coords) {
         const at = await screen(session, point);
         await session.page.mouse.click(at.x, at.y);
         await settle(session);
       }
+      // The final pick auto-commits the primitive; Escape leaves the tool
+      // only once the persisted document gained all four members.
+      await commitEntities(session, before + 4);
       await session.page.keyboard.press("Escape");
       await session.page
         .getByRole("checkbox", { name: "\u5438\u9644", exact: true })

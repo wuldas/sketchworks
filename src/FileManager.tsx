@@ -14,6 +14,7 @@ import {
   Copy,
   Download,
   FileBox,
+  FilePlus2,
   Folder,
   FolderInput,
   FolderOpen,
@@ -56,17 +57,20 @@ export interface FileManagerProps {
   project: CadProject;
   activeFileId?: string | null;
   initialFolderId?: string;
-  onOpen: (
-    file: VfsFileEntry,
-    project: CadProject,
-  ) => boolean | Promise<boolean>;
+  onOpen: (file: VfsFileEntry) => boolean | Promise<boolean>;
+  onCreateProject: (
+    name: string,
+    parentId: string,
+  ) => Promise<VfsFileEntry | undefined>;
   onSaved: (file: VfsFileEntry, project: CadProject) => void;
   onProjectChanged?: (file: VfsFileEntry, project: CadProject) => void;
   onEntriesChanged?: () => void;
+  onLockChange?: (locked: boolean) => void;
   onClose: () => void;
 }
 
 type EntryAction =
+  | { kind: "project"; name: string }
   | { kind: "folder"; name: string }
   | { kind: "rename"; entry: VfsEntry; name: string }
   | {
@@ -323,13 +327,15 @@ export function FileManager({
   activeFileId,
   initialFolderId = ROOT_ID,
   onOpen,
+  onCreateProject,
   onSaved,
   onProjectChanged,
   onEntriesChanged,
+  onLockChange,
   onClose,
 }: FileManagerProps) {
   const titleId = useId();
-  const dialogRef = useRef<HTMLDivElement>(null);
+  const panelRef = useRef<HTMLDivElement>(null);
   const importRef = useRef<HTMLInputElement>(null);
   const imageRef = useRef<HTMLInputElement>(null);
   const operationRef = useRef(false);
@@ -381,6 +387,19 @@ export function FileManager({
       });
   }, [entries, query, sort]);
 
+  useEffect(() => {
+    onLockChange?.(locked);
+    return () => onLockChange?.(false);
+  }, [locked, onLockChange]);
+
+  useEffect(() => {
+    if (mode === "save") {
+      setSaveName(projectFileName(currentDocument.name || "未命名草图"));
+      setAction(null);
+      setSaveRequested(false);
+    }
+  }, [mode]);
+
   const refresh = useCallback(async (target: string) => {
     const request = ++listRequestRef.current;
     setLoading(true);
@@ -406,7 +425,7 @@ export function FileManager({
   useEffect(() => {
     mountedRef.current = true;
     const previousFocus = window.document.activeElement;
-    dialogRef.current?.focus();
+    panelRef.current?.focus();
     return () => {
       mountedRef.current = false;
       listRequestRef.current++;
@@ -496,8 +515,12 @@ export function FileManager({
       return;
     }
     void run("打开项目", async () => {
-      const project = await readProject(entry);
-      if (await onOpen(entry, project)) onClose();
+      if (await onOpen(entry)) {
+        setSaveRequested(false);
+        onEntriesChanged?.();
+        await refresh(folderId);
+        setNotice(`已打开 ${entry.name}`);
+      }
     });
   };
 
@@ -534,7 +557,6 @@ export function FileManager({
     await refresh(folderId);
     setSelectedId(file.id);
     setNotice(`已保存 ${file.name}`);
-    if (mode === "save") onClose();
   };
 
   const requestSave = () => {
@@ -565,6 +587,7 @@ export function FileManager({
     if (!action || busy) return;
     const currentAction = action;
     const label = {
+      project: "新建项目",
       folder: "新建文件夹",
       rename: "重命名",
       move: "移动",
@@ -574,6 +597,19 @@ export function FileManager({
       "attachment-delete": "移除附件",
     }[currentAction.kind];
     void run(label, async () => {
+      if (currentAction.kind === "project") {
+        const name = projectName(currentAction.name);
+        const file = await onCreateProject(name, folderId);
+        if (!file) return;
+        onEntriesChanged?.();
+        setAction(null);
+        setSaveRequested(false);
+        setQuery("");
+        await refresh(folderId);
+        setSelectedId(file.id);
+        setNotice(`已创建 ${file.name}`);
+        return;
+      }
       if (currentAction.kind === "overwrite") {
         await saveCurrent(
           currentAction.name,
@@ -755,10 +791,6 @@ export function FileManager({
     });
   };
 
-  const closeManager = () => {
-    if (!busy && !operationRef.current) onClose();
-  };
-
   const cancelSave = () => {
     if (busy || operationRef.current) return;
     setAction(null);
@@ -767,7 +799,6 @@ export function FileManager({
   };
 
   const handleKey = (event: KeyboardEvent<HTMLDivElement>) => {
-    event.stopPropagation();
     const target = event.target as HTMLElement;
     const editing =
       target.matches("input, textarea, select") || target.isContentEditable;
@@ -784,33 +815,6 @@ export function FileManager({
       ["s", "o", "p"].includes(event.key.toLowerCase())
     ) {
       event.preventDefault();
-      return;
-    }
-    if (event.key === "Tab") {
-      const controls = Array.from(
-        dialogRef.current?.querySelectorAll<HTMLElement>(
-          'button:not(:disabled), input:not(:disabled):not([type="file"]), select:not(:disabled), [tabindex="0"]',
-        ) ?? [],
-      ).filter((element) => element.getClientRects().length > 0);
-      const first = controls[0];
-      const last = controls[controls.length - 1];
-      if (!first) {
-        event.preventDefault();
-        return;
-      }
-      if (
-        event.shiftKey &&
-        (target === first || target === dialogRef.current)
-      ) {
-        event.preventDefault();
-        last.focus();
-      } else if (
-        !event.shiftKey &&
-        (target === last || target === dialogRef.current)
-      ) {
-        event.preventDefault();
-        first.focus();
-      }
       return;
     }
     if (editing) return;
@@ -847,7 +851,7 @@ export function FileManager({
       if (next) {
         setSelectedId(next.id);
         const button = Array.from(
-          dialogRef.current?.querySelectorAll<HTMLButtonElement>(".fm-entry") ??
+          panelRef.current?.querySelectorAll<HTMLButtonElement>(".fm-entry") ??
             [],
         ).find((element) => element.dataset.entryId === next.id);
         button?.focus();
@@ -857,6 +861,7 @@ export function FileManager({
 
   const actionTitle = action
     ? {
+        project: "新建项目",
         folder: "新建文件夹",
         rename: "重命名",
         move: "移动到",
@@ -875,7 +880,7 @@ export function FileManager({
         ? "确认删除"
         : action?.kind === "attachment-delete"
           ? "确认移除"
-          : action?.kind === "folder"
+          : action?.kind === "folder" || action?.kind === "project"
             ? "创建"
             : action?.kind === "move"
               ? "确认移动"
@@ -888,597 +893,585 @@ export function FileManager({
 
   return (
     <div
-      className="modal-shade fm-shade"
-      data-testid="file-manager-backdrop"
-      onPointerDown={(event) => {
-        event.stopPropagation();
-        if (event.target === event.currentTarget) closeManager();
-      }}
+      className="fm-panel"
+      role="region"
+      aria-labelledby={titleId}
+      aria-busy={busy}
+      data-testid="file-manager"
+      data-mode={mode}
+      tabIndex={-1}
+      ref={panelRef}
       onKeyDownCapture={handleKey}
       onKeyUpCapture={(event) => event.stopPropagation()}
       onWheel={(event) => event.stopPropagation()}
     >
-      <div
-        className="fm-dialog"
-        role="dialog"
-        aria-modal="true"
-        aria-labelledby={titleId}
-        aria-busy={busy}
-        data-testid="file-manager"
-        data-mode={mode}
-        tabIndex={-1}
-        ref={dialogRef}
-      >
-        <header className="fm-header">
-          <div className="fm-heading">
-            <FolderOpen size={17} />
-            <h2 id={titleId}>{mode === "save" ? "保存项目" : "文件管理器"}</h2>
-          </div>
-          <span className="fm-storage-label">浏览器本地文件</span>
-          <button
-            type="button"
-            className="icon-button"
-            aria-label="关闭文件管理器"
-            title="关闭文件管理器"
-            disabled={busy}
-            onClick={closeManager}
-          >
-            <X size={17} />
-          </button>
-        </header>
-
-        <div className="fm-pathbar">
-          <button
-            type="button"
-            className="icon-button"
-            aria-label="上一级文件夹"
-            title="上一级文件夹"
-            disabled={locked || folderId === ROOT_ID}
-            onClick={() => navigate(parentId)}
-          >
-            <ArrowUp size={16} />
-          </button>
-          <nav className="fm-breadcrumbs" aria-label="当前文件夹路径">
-            <button
-              type="button"
-              disabled={locked}
-              onClick={() => navigate(ROOT_ID)}
-              title="根目录"
-            >
-              <Home size={14} />
-              <span>根目录</span>
-            </button>
-            {crumbFolders.map((folder, index) => (
-              <span className="fm-crumb" key={folder.id}>
-                <ChevronRight size={12} />
-                <button
-                  type="button"
-                  disabled={locked}
-                  onClick={() => navigate(folder.id)}
-                  title={folder.name}
-                  aria-current={
-                    index === crumbFolders.length - 1 ? "page" : undefined
-                  }
-                >
-                  {folder.name}
-                </button>
-              </span>
-            ))}
-          </nav>
+      <header className="fm-header">
+        <div className="fm-heading">
+          <FolderOpen size={17} />
+          <h2 id={titleId}>项目管理</h2>
         </div>
+        <span className="fm-storage-label">浏览器本地文件</span>
+      </header>
 
-        <div className="fm-toolbar" role="toolbar" aria-label="文件操作">
+      <div className="fm-pathbar">
+        <button
+          type="button"
+          className="icon-button"
+          aria-label="上一级文件夹"
+          title="上一级文件夹"
+          disabled={locked || folderId === ROOT_ID}
+          onClick={() => navigate(parentId)}
+        >
+          <ArrowUp size={16} />
+        </button>
+        <nav className="fm-breadcrumbs" aria-label="当前文件夹路径">
           <button
             type="button"
-            className="fm-tool"
             disabled={locked}
-            onClick={() => {
-              setSaveRequested(false);
-              setAction({ kind: "folder", name: "" });
-            }}
+            onClick={() => navigate(ROOT_ID)}
+            title="根目录"
           >
-            <FolderPlus size={15} />
-            <span>新建文件夹</span>
+            <Home size={14} />
+            <span>根目录</span>
           </button>
-          {mode === "browse" && (
-            <button
-              type="button"
-              className="fm-tool fm-save-tool"
-              disabled={locked}
-              onClick={() => {
-                setSaveRequested(true);
-                setAction(null);
-                setError(null);
-              }}
-            >
-              <Save size={15} />
-              <span>保存当前项目</span>
-            </button>
-          )}
-          <button
-            type="button"
-            className="fm-tool"
-            disabled={locked || !selected}
-            onClick={() => selected && openEntry(selected)}
-          >
-            <FolderOpen size={15} />
-            <span>打开</span>
-          </button>
-          <button
-            type="button"
-            className="fm-tool"
-            disabled={locked || !selected}
-            onClick={() =>
-              selected &&
-              setAction({
-                kind: "rename",
-                entry: selected,
-                name: selected.name,
-              })
-            }
-          >
-            <Pencil size={15} />
-            <span>重命名</span>
-          </button>
-          <button
-            type="button"
-            className="fm-tool"
-            disabled={locked || !selected}
-            onClick={() =>
-              selected &&
-              setAction({
-                kind: "move",
-                entry: selected,
-                parentId: folderId,
-                name: selected.name,
-              })
-            }
-          >
-            <FolderInput size={15} />
-            <span>移动</span>
-          </button>
-          <button
-            type="button"
-            className="fm-tool"
-            disabled={locked || !selected}
-            onClick={() =>
-              selected &&
-              setAction({
-                kind: "copy",
-                entry: selected,
-                parentId: folderId,
-                name:
-                  selected.kind === "file" &&
-                  /\.(?:swcad|asar)$/i.test(selected.name)
-                    ? projectFileName(
-                        `${selected.name.replace(/\.(?:swcad|asar)$/i, "")} 副本`,
-                      )
-                    : `${selected.name} 副本`,
-              })
-            }
-          >
-            <Copy size={15} />
-            <span>复制</span>
-          </button>
-          <button
-            type="button"
-            className="fm-tool fm-danger-tool"
-            disabled={locked || !selected}
-            onClick={() =>
-              selected && setAction({ kind: "delete", entry: selected })
-            }
-          >
-            <Trash2 size={15} />
-            <span>删除</span>
-          </button>
-          <span className="fm-toolbar-spacer" />
-          <button
-            type="button"
-            className="fm-tool"
-            disabled={locked}
-            onClick={() => importRef.current?.click()}
-          >
-            <Upload size={15} />
-            <span>导入</span>
-          </button>
-          <button
-            type="button"
-            className="fm-tool"
-            disabled={locked || !selectedFile}
-            onClick={downloadSelected}
-          >
-            <Download size={15} />
-            <span>下载项目</span>
-          </button>
-        </div>
-
-        <div className="fm-filterbar">
-          <label className="fm-search">
-            <Search size={14} />
-            <input
-              type="search"
-              aria-label="搜索当前文件夹"
-              placeholder="搜索当前文件夹"
-              value={query}
-              disabled={locked}
-              onChange={(event) => setQuery(event.target.value)}
-            />
-          </label>
-          <label className="fm-sort">
-            <span>排序</span>
-            <select
-              aria-label="文件排序"
-              value={sort}
-              disabled={locked}
-              onChange={(event) => setSort(event.target.value as SortOrder)}
-            >
-              <option value="name">名称</option>
-              <option value="updated">最近修改</option>
-              <option value="size">文件大小</option>
-            </select>
-          </label>
-        </div>
-
-        {(error || notice || pending) && (
-          <div
-            className={`fm-feedback ${error ? "fm-error" : ""}`}
-            role={error ? "alert" : "status"}
-          >
-            {pending && <LoaderCircle size={13} className="spin" />}
-            <span>{error || (pending ? `${pending}…` : notice)}</span>
-            {error && (
+          {crumbFolders.map((folder, index) => (
+            <span className="fm-crumb" key={folder.id}>
+              <ChevronRight size={12} />
               <button
                 type="button"
-                className="icon-button"
-                aria-label="关闭错误提示"
-                disabled={busy}
-                onClick={() => setError(null)}
+                disabled={locked}
+                onClick={() => navigate(folder.id)}
+                title={folder.name}
+                aria-current={
+                  index === crumbFolders.length - 1 ? "page" : undefined
+                }
               >
-                <X size={14} />
+                {folder.name}
               </button>
+            </span>
+          ))}
+        </nav>
+      </div>
+
+      <div className="fm-toolbar" role="toolbar" aria-label="文件操作">
+        <button
+          type="button"
+          className="fm-tool fm-primary-tool"
+          disabled={locked}
+          onClick={() => {
+            setSaveRequested(false);
+            setAction({ kind: "project", name: "" });
+          }}
+        >
+          <FilePlus2 size={15} />
+          <span>新建项目</span>
+        </button>
+        <button
+          type="button"
+          className="fm-tool fm-primary-tool"
+          disabled={locked}
+          onClick={() => {
+            setSaveRequested(false);
+            setAction({ kind: "folder", name: "" });
+          }}
+        >
+          <FolderPlus size={15} />
+          <span>新建文件夹</span>
+        </button>
+        <button
+          type="button"
+          className="fm-tool"
+          title="打开"
+          disabled={locked || !selected}
+          onClick={() => selected && openEntry(selected)}
+        >
+          <FolderOpen size={15} />
+          <span>打开</span>
+        </button>
+        <button
+          type="button"
+          className="fm-tool"
+          title="重命名"
+          disabled={locked || !selected}
+          onClick={() =>
+            selected &&
+            setAction({
+              kind: "rename",
+              entry: selected,
+              name: selected.name,
+            })
+          }
+        >
+          <Pencil size={15} />
+          <span>重命名</span>
+        </button>
+        <button
+          type="button"
+          className="fm-tool"
+          title="移动"
+          disabled={locked || !selected}
+          onClick={() =>
+            selected &&
+            setAction({
+              kind: "move",
+              entry: selected,
+              parentId: folderId,
+              name: selected.name,
+            })
+          }
+        >
+          <FolderInput size={15} />
+          <span>移动</span>
+        </button>
+        <button
+          type="button"
+          className="fm-tool"
+          title="复制"
+          disabled={locked || !selected}
+          onClick={() =>
+            selected &&
+            setAction({
+              kind: "copy",
+              entry: selected,
+              parentId: folderId,
+              name:
+                selected.kind === "file" &&
+                /\.(?:swcad|asar)$/i.test(selected.name)
+                  ? projectFileName(
+                      `${selected.name.replace(/\.(?:swcad|asar)$/i, "")} 副本`,
+                    )
+                  : `${selected.name} 副本`,
+            })
+          }
+        >
+          <Copy size={15} />
+          <span>复制</span>
+        </button>
+        <button
+          type="button"
+          className="fm-tool fm-danger-tool"
+          title="删除"
+          disabled={locked || !selected}
+          onClick={() =>
+            selected && setAction({ kind: "delete", entry: selected })
+          }
+        >
+          <Trash2 size={15} />
+          <span>删除</span>
+        </button>
+        <button
+          type="button"
+          className="fm-tool"
+          title="导入"
+          disabled={locked}
+          onClick={() => importRef.current?.click()}
+        >
+          <Upload size={15} />
+          <span>导入</span>
+        </button>
+        <button
+          type="button"
+          className="fm-tool"
+          title="下载项目"
+          disabled={locked || !selectedFile}
+          onClick={downloadSelected}
+        >
+          <Download size={15} />
+          <span>下载项目</span>
+        </button>
+      </div>
+
+      <div className="fm-filterbar">
+        <label className="fm-search">
+          <Search size={14} />
+          <input
+            type="search"
+            aria-label="搜索当前文件夹"
+            placeholder="搜索当前文件夹"
+            value={query}
+            disabled={locked}
+            onChange={(event) => setQuery(event.target.value)}
+          />
+        </label>
+        <label className="fm-sort">
+          <span>排序</span>
+          <select
+            aria-label="文件排序"
+            value={sort}
+            disabled={locked}
+            onChange={(event) => setSort(event.target.value as SortOrder)}
+          >
+            <option value="name">名称</option>
+            <option value="updated">最近修改</option>
+            <option value="size">文件大小</option>
+          </select>
+        </label>
+      </div>
+
+      {(error || notice || pending) && (
+        <div
+          className={`fm-feedback ${error ? "fm-error" : ""}`}
+          role={error ? "alert" : "status"}
+        >
+          {pending && <LoaderCircle size={13} className="spin" />}
+          <span>{error || (pending ? `${pending}…` : notice)}</span>
+          {error && (
+            <button
+              type="button"
+              className="icon-button"
+              aria-label="关闭错误提示"
+              disabled={busy}
+              onClick={() => setError(null)}
+            >
+              <X size={14} />
+            </button>
+          )}
+        </div>
+      )}
+
+      {action && (
+        <form
+          className={`fm-action-panel ${actionDestructive ? "fm-confirm-danger" : ""}`}
+          aria-label={actionTitle}
+          onSubmit={(event) => {
+            event.preventDefault();
+            confirmAction();
+          }}
+        >
+          <strong className="fm-action-title">{actionTitle}</strong>
+          {(action.kind === "project" ||
+            action.kind === "folder" ||
+            action.kind === "rename" ||
+            action.kind === "copy") && (
+            <label className="fm-field">
+              <span>
+                {action.kind === "project"
+                  ? "项目名称"
+                  : action.kind === "folder"
+                    ? "文件夹名称"
+                    : "名称"}
+              </span>
+              <input
+                autoFocus
+                aria-label={
+                  action.kind === "project"
+                    ? "项目名称"
+                    : action.kind === "folder"
+                      ? "文件夹名称"
+                      : "名称"
+                }
+                value={action.name}
+                maxLength={255}
+                disabled={busy}
+                spellCheck={false}
+                onChange={(event) =>
+                  setAction({ ...action, name: event.target.value })
+                }
+              />
+            </label>
+          )}
+          {(action.kind === "move" || action.kind === "copy") && (
+            <FolderMoveChooser
+              entries={allEntries}
+              value={action.parentId}
+              disabled={busy}
+              onChange={(value) => setAction({ ...action, parentId: value })}
+            />
+          )}
+          {action.kind === "move" && (
+            <p className="fm-action-message">
+              移动「{action.entry.name}」到所选文件夹。
+            </p>
+          )}
+          {action.kind === "delete" && (
+            <p className="fm-action-message">
+              {action.entry.kind === "folder"
+                ? `删除文件夹「${action.entry.name}」及其中 ${descendants(action.entry, allEntries).size - 1} 个文件和文件夹？`
+                : `删除项目「${action.entry.name}」？`}
+              <span>此操作无法撤销。</span>
+            </p>
+          )}
+          {action.kind === "overwrite" && (
+            <p className="fm-action-message">
+              「{action.name}」已存在。覆盖后将替换这个项目文件的内容。
+            </p>
+          )}
+          {action.kind === "attachment-delete" && (
+            <p className="fm-action-message">
+              从项目中移除附件「{action.name}」？<span>此操作无法撤销。</span>
+            </p>
+          )}
+          <div className="fm-action-buttons">
+            <button
+              type="button"
+              className="button small"
+              disabled={busy}
+              onClick={() => setAction(null)}
+            >
+              取消操作
+            </button>
+            <button
+              type="submit"
+              className={`button small ${actionDestructive ? "fm-danger-button" : "primary"}`}
+              disabled={busy}
+            >
+              {actionDestructive ? <Trash2 size={13} /> : <Check size={13} />}
+              {actionConfirm}
+            </button>
+          </div>
+        </form>
+      )}
+
+      <div className="fm-content">
+        <section className="fm-files" aria-label="当前文件夹内容">
+          <div className="fm-list-header" aria-hidden="true">
+            <span>名称</span>
+            <span>修改时间</span>
+            <span>大小</span>
+          </div>
+          <div
+            className="fm-file-list"
+            role="listbox"
+            aria-label="项目文件"
+            data-testid="file-manager-list"
+          >
+            {loading ? (
+              <div className="fm-empty" role="status">
+                <LoaderCircle size={18} className="spin" />
+                <span>正在读取文件…</span>
+              </div>
+            ) : !visibleEntries.length ? (
+              <div className="fm-empty" role="status">
+                <FolderOpen size={24} />
+                <span>{query ? "没有匹配的文件" : "当前文件夹为空"}</span>
+              </div>
+            ) : (
+              visibleEntries.map((entry) => (
+                <button
+                  type="button"
+                  role="option"
+                  aria-selected={entry.id === selectedId}
+                  aria-label={entry.name}
+                  title={entry.name}
+                  className={`fm-entry ${entry.kind === "folder" ? "fm-folder-entry" : ""}`}
+                  key={entry.id}
+                  data-testid="file-manager-entry"
+                  data-entry-id={entry.id}
+                  data-entry-kind={entry.kind}
+                  disabled={locked}
+                  onClick={() => {
+                    setSelectedId(entry.id);
+                    setError(null);
+                  }}
+                  onDoubleClick={() => openEntry(entry)}
+                >
+                  <span className="fm-entry-name">
+                    {entry.kind === "folder" ? (
+                      <Folder size={17} />
+                    ) : (
+                      <FileBox size={17} />
+                    )}
+                    <span className="fm-entry-label">{entry.name}</span>
+                    {entry.id === activeFileId && (
+                      <span className="fm-active-tag">当前</span>
+                    )}
+                  </span>
+                  <span className="fm-entry-time">
+                    {timeLabel(entry.updatedAt)}
+                  </span>
+                  <span className="fm-entry-size">
+                    {entry.kind === "folder" ? "—" : sizeLabel(entry.size)}
+                  </span>
+                </button>
+              ))
             )}
           </div>
-        )}
+        </section>
 
-        {action && (
-          <form
-            className={`fm-action-panel ${actionDestructive ? "fm-confirm-danger" : ""}`}
-            aria-label={actionTitle}
-            onSubmit={(event) => {
-              event.preventDefault();
-              confirmAction();
-            }}
+        {selectedFile && (
+          <aside
+            className="fm-attachments"
+            aria-label="项目附件"
+            data-testid="file-manager-attachments"
           >
-            <strong className="fm-action-title">{actionTitle}</strong>
-            {(action.kind === "folder" ||
-              action.kind === "rename" ||
-              action.kind === "copy") && (
-              <label className="fm-field">
-                <span>{action.kind === "folder" ? "文件夹名称" : "名称"}</span>
-                <input
-                  autoFocus
-                  aria-label={action.kind === "folder" ? "文件夹名称" : "名称"}
-                  value={action.name}
-                  maxLength={255}
-                  disabled={busy}
-                  spellCheck={false}
-                  onChange={(event) =>
-                    setAction({ ...action, name: event.target.value })
-                  }
-                />
-              </label>
-            )}
-            {(action.kind === "move" || action.kind === "copy") && (
-              <FolderMoveChooser
-                entries={allEntries}
-                value={action.parentId}
-                disabled={busy}
-                onChange={(value) => setAction({ ...action, parentId: value })}
-              />
-            )}
-            {action.kind === "move" && (
-              <p className="fm-action-message">
-                移动「{action.entry.name}」到所选文件夹。
-              </p>
-            )}
-            {action.kind === "delete" && (
-              <p className="fm-action-message">
-                {action.entry.kind === "folder"
-                  ? `删除文件夹「${action.entry.name}」及其中 ${descendants(action.entry, allEntries).size - 1} 个文件和文件夹？`
-                  : `删除项目「${action.entry.name}」？`}
-                <span>此操作无法撤销。</span>
-              </p>
-            )}
-            {action.kind === "overwrite" && (
-              <p className="fm-action-message">
-                「{action.name}」已存在。覆盖后将替换这个项目文件的内容。
-              </p>
-            )}
-            {action.kind === "attachment-delete" && (
-              <p className="fm-action-message">
-                从项目中移除附件「{action.name}」？<span>此操作无法撤销。</span>
-              </p>
-            )}
-            <div className="fm-action-buttons">
+            <div className="fm-attachment-heading">
+              <strong>
+                <Paperclip size={14} />
+                项目附件
+              </strong>
               <button
                 type="button"
                 className="button small"
-                disabled={busy}
-                onClick={() => setAction(null)}
+                disabled={locked || !attachmentProject}
+                onClick={() => imageRef.current?.click()}
               >
-                取消操作
-              </button>
-              <button
-                type="submit"
-                className={`button small ${actionDestructive ? "fm-danger-button" : "primary"}`}
-                disabled={busy}
-              >
-                {actionDestructive ? <Trash2 size={13} /> : <Check size={13} />}
-                {actionConfirm}
+                <ImagePlus size={14} />
+                添加图片
               </button>
             </div>
-          </form>
-        )}
-
-        <div className="fm-content">
-          <section className="fm-files" aria-label="当前文件夹内容">
-            <div className="fm-list-header" aria-hidden="true">
-              <span>名称</span>
-              <span>修改时间</span>
-              <span>大小</span>
-            </div>
-            <div
-              className="fm-file-list"
-              role="listbox"
-              aria-label="项目文件"
-              data-testid="file-manager-list"
-            >
-              {loading ? (
-                <div className="fm-empty" role="status">
-                  <LoaderCircle size={18} className="spin" />
-                  <span>正在读取文件…</span>
-                </div>
-              ) : !visibleEntries.length ? (
-                <div className="fm-empty" role="status">
-                  <FolderOpen size={24} />
-                  <span>{query ? "没有匹配的文件" : "当前文件夹为空"}</span>
-                </div>
+            <p className="fm-selected-name" title={selectedFile.name}>
+              {selectedFile.name}
+            </p>
+            <div className="fm-attachment-list">
+              {attachmentLoading ? (
+                <p className="fm-attachment-empty" role="status">
+                  正在读取附件…
+                </p>
+              ) : attachmentError ? (
+                <p className="fm-attachment-error" role="alert">
+                  {attachmentError}
+                </p>
+              ) : !selectedAttachments.length ? (
+                <p className="fm-attachment-empty">暂无附件</p>
               ) : (
-                visibleEntries.map((entry) => (
-                  <button
-                    type="button"
-                    role="option"
-                    aria-selected={entry.id === selectedId}
-                    aria-label={entry.name}
-                    title={entry.name}
-                    className={`fm-entry ${entry.kind === "folder" ? "fm-folder-entry" : ""}`}
-                    key={entry.id}
-                    data-testid="file-manager-entry"
-                    data-entry-id={entry.id}
-                    data-entry-kind={entry.kind}
-                    disabled={locked}
-                    onClick={() => {
-                      setSelectedId(entry.id);
-                      setError(null);
-                    }}
-                    onDoubleClick={() => openEntry(entry)}
+                selectedAttachments.map((attachment) => (
+                  <div
+                    className="fm-attachment"
+                    key={attachment.id}
+                    data-attachment-id={attachment.id}
                   >
-                    <span className="fm-entry-name">
-                      {entry.kind === "folder" ? (
-                        <Folder size={17} />
-                      ) : (
-                        <FileBox size={17} />
-                      )}
-                      <span className="fm-entry-label">{entry.name}</span>
-                      {entry.id === activeFileId && (
-                        <span className="fm-active-tag">当前</span>
-                      )}
-                    </span>
-                    <span className="fm-entry-time">
-                      {timeLabel(entry.updatedAt)}
-                    </span>
-                    <span className="fm-entry-size">
-                      {entry.kind === "folder" ? "—" : sizeLabel(entry.size)}
-                    </span>
-                  </button>
+                    <AttachmentPreview
+                      project={attachmentProject!}
+                      attachment={attachment}
+                    />
+                    <div className="fm-attachment-info">
+                      <span title={attachment.name}>{attachment.name}</span>
+                      <small>
+                        {imageTypes.has(attachment.mimeType) ? (
+                          <ImageIcon size={10} />
+                        ) : (
+                          <Paperclip size={10} />
+                        )}
+                        {sizeLabel(attachment.size)}
+                      </small>
+                    </div>
+                    <div className="fm-attachment-actions">
+                      <button
+                        type="button"
+                        className="icon-button"
+                        aria-label={`下载附件 ${attachment.name}`}
+                        title="下载附件"
+                        disabled={locked}
+                        onClick={() => downloadAttachment(attachment)}
+                      >
+                        <Download size={14} />
+                      </button>
+                      <button
+                        type="button"
+                        className="icon-button"
+                        aria-label={`移除附件 ${attachment.name}`}
+                        title="移除附件"
+                        disabled={locked}
+                        onClick={() =>
+                          setAction({
+                            kind: "attachment-delete",
+                            file: selectedFile,
+                            attachmentId: attachment.id,
+                            name: attachment.name,
+                          })
+                        }
+                      >
+                        <Trash2 size={14} />
+                      </button>
+                    </div>
+                  </div>
                 ))
               )}
             </div>
-          </section>
+          </aside>
+        )}
+      </div>
 
-          {selectedFile && (
-            <aside
-              className="fm-attachments"
-              aria-label="项目附件"
-              data-testid="file-manager-attachments"
+      <footer className="fm-footer">
+        {saveVisible ? (
+          <form
+            className="fm-save-form"
+            aria-label="保存项目文件"
+            onSubmit={(event) => {
+              event.preventDefault();
+              requestSave();
+            }}
+          >
+            <label className="fm-field fm-save-name">
+              <span>文件名</span>
+              <input
+                aria-label="项目文件名"
+                value={saveName}
+                maxLength={255}
+                disabled={locked}
+                spellCheck={false}
+                onChange={(event) => setSaveName(event.target.value)}
+              />
+            </label>
+            <span
+              className="fm-save-location"
+              title={folderLabel(folderId, allEntries)}
             >
-              <div className="fm-attachment-heading">
-                <strong>
-                  <Paperclip size={14} />
-                  项目附件
-                </strong>
-                <button
-                  type="button"
-                  className="button small"
-                  disabled={locked || !attachmentProject}
-                  onClick={() => imageRef.current?.click()}
-                >
-                  <ImagePlus size={14} />
-                  添加图片
-                </button>
-              </div>
-              <p className="fm-selected-name" title={selectedFile.name}>
-                {selectedFile.name}
-              </p>
-              <div className="fm-attachment-list">
-                {attachmentLoading ? (
-                  <p className="fm-attachment-empty" role="status">
-                    正在读取附件…
-                  </p>
-                ) : attachmentError ? (
-                  <p className="fm-attachment-error" role="alert">
-                    {attachmentError}
-                  </p>
-                ) : !selectedAttachments.length ? (
-                  <p className="fm-attachment-empty">暂无附件</p>
-                ) : (
-                  selectedAttachments.map((attachment) => (
-                    <div
-                      className="fm-attachment"
-                      key={attachment.id}
-                      data-attachment-id={attachment.id}
-                    >
-                      <AttachmentPreview
-                        project={attachmentProject!}
-                        attachment={attachment}
-                      />
-                      <div className="fm-attachment-info">
-                        <span title={attachment.name}>{attachment.name}</span>
-                        <small>
-                          {imageTypes.has(attachment.mimeType) ? (
-                            <ImageIcon size={10} />
-                          ) : (
-                            <Paperclip size={10} />
-                          )}
-                          {sizeLabel(attachment.size)}
-                        </small>
-                      </div>
-                      <div className="fm-attachment-actions">
-                        <button
-                          type="button"
-                          className="icon-button"
-                          aria-label={`下载附件 ${attachment.name}`}
-                          title="下载附件"
-                          disabled={locked}
-                          onClick={() => downloadAttachment(attachment)}
-                        >
-                          <Download size={14} />
-                        </button>
-                        <button
-                          type="button"
-                          className="icon-button"
-                          aria-label={`移除附件 ${attachment.name}`}
-                          title="移除附件"
-                          disabled={locked}
-                          onClick={() =>
-                            setAction({
-                              kind: "attachment-delete",
-                              file: selectedFile,
-                              attachmentId: attachment.id,
-                              name: attachment.name,
-                            })
-                          }
-                        >
-                          <Trash2 size={14} />
-                        </button>
-                      </div>
-                    </div>
-                  ))
-                )}
-              </div>
-            </aside>
-          )}
-        </div>
-
-        <footer className="fm-footer">
-          {saveVisible ? (
-            <form
-              className="fm-save-form"
-              aria-label="保存项目文件"
-              onSubmit={(event) => {
-                event.preventDefault();
-                requestSave();
-              }}
-            >
-              <label className="fm-field fm-save-name">
-                <span>文件名</span>
-                <input
-                  aria-label="项目文件名"
-                  value={saveName}
-                  maxLength={255}
-                  disabled={locked}
-                  spellCheck={false}
-                  onChange={(event) => setSaveName(event.target.value)}
-                />
-              </label>
-              <span
-                className="fm-save-location"
-                title={folderLabel(folderId, allEntries)}
-              >
-                保存到：{folderLabel(folderId, allEntries)}
-              </span>
-              <div className="fm-footer-buttons">
-                <button
-                  type="button"
-                  className="button"
-                  disabled={busy}
-                  onClick={cancelSave}
-                >
-                  取消
-                </button>
-                <button
-                  type="submit"
-                  className="button primary"
-                  disabled={locked}
-                >
-                  <Save size={14} />
-                  保存
-                </button>
-              </div>
-            </form>
-          ) : (
-            <>
-              <span className="fm-count">
-                {query
-                  ? `${visibleEntries.length} / ${entries.length}`
-                  : entries.length}{" "}
-                个项目
-              </span>
-              <span className="fm-selection-summary" title={selected?.name}>
-                {selected?.name || ""}
-              </span>
+              保存到：{folderLabel(folderId, allEntries)}
+            </span>
+            <div className="fm-footer-buttons">
               <button
                 type="button"
                 className="button"
                 disabled={busy}
-                onClick={closeManager}
+                onClick={cancelSave}
               >
-                关闭
+                取消
               </button>
-            </>
-          )}
-        </footer>
-        <input
-          ref={importRef}
-          type="file"
-          accept=".swcad,.asar,.json,application/json"
-          multiple
-          hidden
-          data-testid="file-manager-import"
-          aria-label="导入项目文件"
-          disabled={locked}
-          onChange={(event) => {
-            const files = Array.from(event.target.files ?? []);
-            event.target.value = "";
-            importFiles(files);
-          }}
-        />
-        <input
-          ref={imageRef}
-          type="file"
-          accept=".png,.jpg,.jpeg,.webp,.gif,image/png,image/jpeg,image/webp,image/gif"
-          multiple
-          hidden
-          data-testid="file-manager-image-input"
-          aria-label="添加项目图片"
-          disabled={locked || !attachmentProject}
-          onChange={(event) => {
-            const files = Array.from(event.target.files ?? []);
-            event.target.value = "";
-            addImages(files);
-          }}
-        />
-      </div>
+              <button
+                type="submit"
+                className="button primary"
+                disabled={locked}
+              >
+                <Save size={14} />
+                保存
+              </button>
+            </div>
+          </form>
+        ) : (
+          <>
+            <span className="fm-count">
+              {query
+                ? `${visibleEntries.length} / ${entries.length}`
+                : entries.length}{" "}
+              个项目
+            </span>
+            <span className="fm-selection-summary" title={selected?.name}>
+              {selected?.name || ""}
+            </span>
+          </>
+        )}
+      </footer>
+      <input
+        ref={importRef}
+        type="file"
+        accept=".swcad,.asar,.json,application/json"
+        multiple
+        hidden
+        data-testid="file-manager-import"
+        aria-label="导入项目文件"
+        disabled={locked}
+        onChange={(event) => {
+          const files = Array.from(event.target.files ?? []);
+          event.target.value = "";
+          importFiles(files);
+        }}
+      />
+      <input
+        ref={imageRef}
+        type="file"
+        accept=".png,.jpg,.jpeg,.webp,.gif,image/png,image/jpeg,image/webp,image/gif"
+        multiple
+        hidden
+        data-testid="file-manager-image-input"
+        aria-label="添加项目图片"
+        disabled={locked || !attachmentProject}
+        onChange={(event) => {
+          const files = Array.from(event.target.files ?? []);
+          event.target.value = "";
+          addImages(files);
+        }}
+      />
     </div>
   );
 }

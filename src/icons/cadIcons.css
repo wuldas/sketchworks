@@ -1,0 +1,29 @@
+:root,
+[data-theme="light"] {
+  /* Light theme keeps the original CAD palette. */
+  --cad-icon-ink: #040000;
+  --cad-icon-strong: #515151;
+  --cad-icon-muted: #676768;
+  --cad-icon-subtle: #a6a6a6;
+  --cad-icon-blue: #20a2dd;
+  --cad-icon-orange: #f39835;
+  --cad-icon-line: #dcdddd;
+}
+
+[data-theme="dark"] {
+  /* Dark theme lifts luminance while retaining the blue/orange identity. */
+  --cad-icon-ink: #f2f5f6;
+  --cad-icon-strong: #c9d0d4;
+  --cad-icon-muted: #aab3b8;
+  --cad-icon-subtle: #7c878d;
+  --cad-icon-blue: #5bc8f2;
+  --cad-icon-orange: #ffb25e;
+  --cad-icon-line: #65717a;
+}
+
+.cad-icon {
+  display: inline-block;
+  flex-shrink: 0;
+  vertical-align: middle;
+  pointer-events: none;
+}

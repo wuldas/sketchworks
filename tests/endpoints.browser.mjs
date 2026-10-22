@@ -155,6 +155,12 @@ async function open(
       metadata: () => canvas.evaluate((element) => element.__cadViewport),
     };
     await settle(session);
+    const projectToggle = page.locator(
+      '.app-header button[aria-label="项目管理"]',
+    );
+    if ((await projectToggle.getAttribute("aria-pressed")) === "true")
+      await projectToggle.click();
+    await settle(session);
     const initial = await saved(session);
     assert.deepEqual(
       sketch(initial).entities.map((item) => item.id),
@@ -187,6 +193,30 @@ async function saved(session) {
     storage,
   );
 }
+// Fixed-count tools commit the final canvas pick without a confirm button;
+// Escape waits until the persisted sketch really contains the new geometry.
+const entityCount = (session) =>
+  session.page.evaluate((key) => {
+    const parsed = JSON.parse(localStorage.getItem(key) ?? "null");
+    return (parsed?.sketches ?? []).reduce(
+      (total, sketch) => total + sketch.entities.length,
+      0,
+    );
+  }, storage);
+const commitEntities = (session, expected) =>
+  session.page.waitForFunction(
+    ({ key, expected }) => {
+      const parsed = JSON.parse(localStorage.getItem(key) ?? "null");
+      return (
+        (parsed?.sketches ?? []).reduce(
+          (total, sketch) => total + sketch.entities.length,
+          0,
+        ) >= expected
+      );
+    },
+    { key: storage, expected },
+    { timeout: 20000 },
+  );
 async function screen(session, point) {
   const state = await session.metadata(),
     box = await session.canvas.boundingBox();
@@ -332,14 +362,37 @@ async function panZoom(session) {
     after: await session.metadata(),
   };
 }
+// Pan/zoom through real controls so creation fixtures remain on uncovered canvas.
+async function prepareDrawingView(session) {
+  if (session.creationViewPrepared) return;
+  session.creationViewPrepared = true;
+  const zoomOut = session.page.locator('.view-controls button[title="缩小"]');
+  await zoomOut.click();
+  await zoomOut.click();
+  const box = await session.canvas.boundingBox();
+  const narrow = box.width < 700;
+  const from = { x: box.x + box.width * 0.2, y: box.y + box.height * 0.65 };
+  await session.page.mouse.move(from.x, from.y);
+  await session.page.mouse.down({ button: "middle" });
+  await session.page.mouse.move(
+    from.x - (narrow ? 0 : 148),
+    from.y + (narrow ? box.height * 0.28 : 0),
+    { steps: 5 },
+  );
+  await session.page.mouse.up({ button: "middle" });
+  await settle(session);
+}
 // Endpoint/grid cues are only captured while a drawing tool collects points,
 // so hover expectations enter the line tool explicitly.
 async function startDrawing(session) {
   await button(session.page, "\u76f4\u7ebf").click();
   await settle(session);
+  await prepareDrawingView(session);
 }
 async function lineBetween(session, start, end, offsets = [7, 1]) {
+  const before = await entityCount(session);
   await button(session.page, "\u76f4\u7ebf").click();
+  await prepareDrawingView(session);
   const first = await moveNear(session, start, ...offsets);
   await session.page.mouse.click(
     first.position.x + offsets[0],
@@ -352,6 +405,9 @@ async function lineBetween(session, start, end, offsets = [7, 1]) {
     last.position.y + offsets[1],
   );
   await settle(session);
+  // The second pick auto-commits the segment; Escape leaves the still-active
+  // line tool only once the persisted document gained the new entity.
+  await commitEntities(session, before + 1);
   await session.page.keyboard.press("Escape");
   await button(session.page, "\u9009\u62e9").click();
   return {
@@ -753,12 +809,12 @@ try {
     drawingFixture(),
     async (session) => {
       await option(session, "\u5438\u9644", false);
-      const state = await session.metadata();
       const drawn = await lineBetween(
         session,
         sourceA.points[1],
         sourceB.points[0],
       );
+      const state = await session.metadata();
       const added = sketch(drawn.doc).entities.at(-1);
       assert.equal(drawn.first, null);
       assert.equal(drawn.last, null);

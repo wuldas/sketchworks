@@ -3,6 +3,7 @@ import { createRequire } from "node:module";
 import {
   createGeometry,
   appendGeometry,
+  creationInputPoints,
   defaultConfig,
   toolLabels,
   type Tool,
@@ -17,6 +18,10 @@ import {
   conicAt,
   dot,
   sub,
+  add,
+  mul,
+  cross,
+  normalize,
   EPS,
 } from "./geometry";
 import { entity, type Sketch, type XY, type Entity } from "./model";
@@ -44,6 +49,11 @@ const inputs: Record<Tool, XY[]> = {
   centerRectangle: [
     { x: 3, y: 4 },
     { x: 25, y: 17 },
+  ],
+  threeRectangle: [
+    { x: 3, y: 4 },
+    { x: 31, y: 13 },
+    { x: 12, y: 27 },
   ],
   circle: [
     { x: 3, y: 4 },
@@ -350,6 +360,43 @@ describe("creation tools with real WASM", () => {
       });
     },
   );
+  it("inscribed polygon puts the sizing pick at the edge-0 midpoint", () => {
+    const [center, pick] = inputs.polygon,
+      s = make("polygon", inputs.polygon, {
+        ...defaultConfig,
+        sides: 6,
+        polygonOuter: true,
+      }),
+      before = structuredClone(s.entities);
+    solve(s);
+    unchanged(before, s.entities);
+    const edge = s.entities[0],
+      mid = {
+        x: (edge.points[0].x + edge.points[1].x) / 2,
+        y: (edge.points[0].y + edge.points[1].y) / 2,
+      };
+    expect(dist(mid, pick)).toBeLessThan(1e-7);
+    expect(dist(edge.points[0], pick)).toBeGreaterThan(1e-3);
+    for (const e of s.entities)
+      expect(dist(e.points[0], center)).toBeCloseTo(
+        dist(center, pick) / Math.cos(Math.PI / 6),
+        6,
+      );
+  });
+  it("circumscribed polygon keeps the sizing pick on the circumcircle as vertex zero", () => {
+    const [, pick] = inputs.polygon,
+      s = make("polygon", inputs.polygon, {
+        ...defaultConfig,
+        sides: 6,
+        polygonOuter: false,
+      });
+    solve(s);
+    expect(dist(s.entities[0].points[0], pick)).toBeLessThan(1e-7);
+    expect(dist(s.entities[0].points[0], s.entities[0].points[1])).toBeCloseTo(
+      dist(s.entities[1].points[0], s.entities[1].points[1]),
+      6,
+    );
+  });
   it("outer polygon matches the requested apothem", () => {
     const s = make("polygon", inputs.polygon, {
       ...defaultConfig,
@@ -394,6 +441,112 @@ describe("creation tools with real WASM", () => {
       expect(dist(a, b)).toBeLessThan(1e-7);
     expect(arcInfo(cap1).sweep).toBeCloseTo(Math.PI, 6);
     expect(arcInfo(cap2).sweep).toBeCloseTo(Math.PI, 6);
+  });
+  it("three-point rectangle builds vertices from the signed normal offset", () => {
+    const [a, b, c] = inputs.threeRectangle,
+      s = make("threeRectangle"),
+      before = structuredClone(s.entities),
+      d = sub(b, a),
+      base = Math.hypot(d.x, d.y),
+      n = { x: -d.y / base, y: d.x / base },
+      h = dot(sub(c, a), n);
+    expect(h).toBeGreaterThan(0);
+    solve(s);
+    unchanged(before, s.entities);
+    const [l0, l1, l2, l3] = s.entities,
+      [v0, v1, v2, v3] = [l0, l1, l2, l3].map((e) => e.points[0]),
+      expected = [a, b, add(b, mul(n, h)), add(a, mul(n, h))];
+    [v0, v1, v2, v3].forEach((v, i) =>
+      expect(dist(v, expected[i])).toBeLessThan(1e-7),
+    );
+    expect(Math.abs(dot(sub(v1, v0), sub(v2, v1)))).toBeLessThan(1e-9);
+    expect(dist(l3.points[1], v0)).toBeLessThan(1e-7);
+    expect(s.constraints.filter((c) => c.kind === "coincident")).toHaveLength(
+      4,
+    );
+    expect(s.constraints.filter((c) => c.kind === "parallel")).toHaveLength(2);
+    expect(
+      s.constraints.filter((c) => c.kind === "perpendicular"),
+    ).toHaveLength(1);
+    expect(
+      s.constraints.some(
+        (c) => c.kind === "horizontal" || c.kind === "vertical",
+      ),
+    ).toBe(false);
+  });
+  it("three-point rectangle keeps a negative height on the other baseline side", () => {
+    const a = { x: 3, y: 4 },
+      b = { x: 31, y: 13 },
+      ps = [a, b, { x: 12, y: -19 }],
+      s = make("threeRectangle", ps),
+      before = structuredClone(s.entities),
+      d = sub(b, a),
+      base = Math.hypot(d.x, d.y),
+      n = { x: -d.y / base, y: d.x / base },
+      h = dot(sub(ps[2], a), n);
+    expect(h).toBeLessThan(0);
+    solve(s);
+    unchanged(before, s.entities);
+    const [, , l2, l3] = s.entities;
+    expect(dist(l2.points[0], add(b, mul(n, h)))).toBeLessThan(1e-7);
+    expect(dist(l2.points[1], add(a, mul(n, h)))).toBeLessThan(1e-7);
+    expect(Math.abs(dot(sub(l2.points[1], a), d) / base)).toBeLessThan(1e-9);
+  });
+  it("rejects a degenerate three-point rectangle baseline or height", () => {
+    expect(() =>
+      createGeometry(
+        "threeRectangle",
+        [
+          { x: 3, y: 4 },
+          { x: 3, y: 4 },
+          { x: 12, y: 27 },
+        ],
+        { ...defaultConfig },
+      ),
+    ).toThrow("矩形基线长度不能为零");
+    expect(() =>
+      createGeometry(
+        "threeRectangle",
+        [
+          { x: 3, y: 4 },
+          { x: 31, y: 13 },
+          { x: 17, y: 8.5 },
+        ],
+        { ...defaultConfig },
+      ),
+    ).toThrow("矩形高度不能为零");
+  });
+  it("three-point rectangle stays rectangular after dragging an opposite corner", () => {
+    const s = make("threeRectangle"),
+      [a, b] = inputs.threeRectangle;
+    solve(s);
+    const [l0, l1, l2, l3] = s.entities;
+    s.constraints.push({
+      id: "fix-a",
+      kind: "fixed",
+      refs: [l0.points[0].id],
+    });
+    const dragged = solveSketch(s, {
+      pointId: l2.points[0].id,
+      x: b.x - 4,
+      y: l2.points[0].y + 6,
+      exact: true,
+    });
+    expect(dragged.ok, JSON.stringify(dragged)).toBe(true);
+    validGeometry(s);
+    const [v0, v1, v2, v3] = [l0, l1, l2, l3].map((e) => e.points[0]);
+    expect(dist(l0.points[1], l1.points[0])).toBeLessThan(1e-7);
+    expect(dist(l1.points[1], l2.points[0])).toBeLessThan(1e-7);
+    expect(dist(l2.points[1], l3.points[0])).toBeLessThan(1e-7);
+    expect(dist(l3.points[1], l0.points[0])).toBeLessThan(1e-7);
+    expect(Math.abs(dot(sub(v1, v0), sub(v2, v1)))).toBeLessThan(1e-6);
+    expect(Math.abs(cross(sub(v1, v0), sub(v3, v2)))).toBeLessThan(1e-6);
+    expect(Math.abs(cross(sub(v2, v1), sub(v0, v3)))).toBeLessThan(1e-6);
+    expect(dist(v0, a)).toBeLessThan(1e-9);
+    const d = sub(v1, v0),
+      base = Math.hypot(d.x, d.y),
+      n = { x: -d.y / base, y: d.x / base };
+    expect(dist(v3, add(v0, mul(n, dot(sub(v2, v0), n))))).toBeLessThan(1e-6);
   });
   it("rotated slot keeps cap radii and outward bulges", () => {
     const ps = [
@@ -468,6 +621,7 @@ describe("creation tools with real WASM", () => {
   it.each([
     "rectangle",
     "centerRectangle",
+    "threeRectangle",
     "polygon",
     "slot",
     "arcSlot",
@@ -483,4 +637,197 @@ describe("creation tools with real WASM", () => {
       expect(s.entities.every((e) => e.construction)).toBe(true);
     },
   );
+});
+
+describe("creation angle contract", () => {
+  const angled = (angle: number) => ({ ...defaultConfig, angle });
+
+  it("is idempotent when handed already transformed picks", () => {
+    const once = creationInputPoints("polygon", inputs.polygon, angled(125));
+    const fromRaw = make("polygon", inputs.polygon, angled(125)),
+      fromMoved = make("polygon", once, angled(125));
+    fromMoved.entities.forEach((e, i) =>
+      e.points.forEach((p, j) =>
+        expect(dist(p, fromRaw.entities[i].points[j])).toBeLessThan(1e-9),
+      ),
+    );
+  });
+
+  it.each([-340, 380, -700, 740] as const)(
+    "wraps %i° onto the same 20° orientation",
+    (angle) => {
+      const base = make("polygon", inputs.polygon, angled(20)),
+        wrapped = make("polygon", inputs.polygon, angled(angle));
+      wrapped.entities.forEach((e, i) =>
+        e.points.forEach((p, j) => {
+          expect(dist(p, base.entities[i].points[j])).toBeLessThan(1e-9);
+        }),
+      );
+    },
+  );
+
+  it.each([30, -150, 405] as const)(
+    "center rectangle solves at %i° with the exact picked corner",
+    (angle) => {
+      const [a, b] = inputs.centerRectangle,
+        theta = (angle * Math.PI) / 180,
+        u = { x: Math.cos(theta), y: Math.sin(theta) },
+        w = { x: -u.y, y: u.x },
+        s = make("centerRectangle", inputs.centerRectangle, angled(angle));
+      const before = structuredClone(s.entities);
+      solve(s);
+      unchanged(before, s.entities);
+      const corners = s.entities.map((e) => e.points[0]);
+      expect(dist(s.entities[2].points[0], b)).toBeLessThan(1e-7);
+      for (const [p, q] of [
+        [0, 2],
+        [1, 3],
+      ] as const)
+        expect(dist(mul(add(corners[p], corners[q]), 0.5), a)).toBeLessThan(
+          1e-7,
+        );
+      for (let i = 0; i < 4; i++) {
+        const edge = sub(corners[(i + 1) % 4], corners[i]),
+          axis = i % 2 ? w : u;
+        expect(Math.abs(cross(edge, axis))).toBeLessThan(1e-7);
+      }
+    },
+  );
+
+  it.each([NaN, Infinity] as const)(
+    "createGeometry throws on a non-finite %p angle instead of assuming auto",
+    (angle) => {
+      expect(() =>
+        createGeometry("centerRectangle", inputs.centerRectangle, {
+          ...defaultConfig,
+          angle,
+        }),
+      ).toThrow(Error);
+      expect(() =>
+        createGeometry("polygon", inputs.polygon, { ...defaultConfig, angle }),
+      ).toThrow(Error);
+      expect(() =>
+        createGeometry("line", inputs.line, { ...defaultConfig, angle }),
+      ).toThrow(Error);
+    },
+  );
+
+  it.each([
+    { mode: "inscribed", outer: false },
+    { mode: "circumscribed", outer: true },
+  ] as const)(
+    "angled $mode polygon keeps its radius rule and orientation",
+    ({ outer }) => {
+      const [center, pick] = inputs.polygon,
+        sides = 5,
+        angle = 210,
+        theta = (angle * Math.PI) / 180 - (outer ? Math.PI / sides : 0),
+        r = dist(center, pick) / (outer ? Math.cos(Math.PI / sides) : 1),
+        s = make("polygon", inputs.polygon, {
+          ...defaultConfig,
+          sides,
+          polygonOuter: outer,
+          angle,
+        }),
+        before = structuredClone(s.entities);
+      solve(s);
+      unchanged(before, s.entities);
+      expect(s.entities).toHaveLength(sides);
+      s.entities.forEach((e, i) => {
+        const phi = theta + (Math.PI * 2 * i) / sides,
+          vertex = add(center, {
+            x: r * Math.cos(phi),
+            y: r * Math.sin(phi),
+          });
+        expect(dist(e.points[0], center)).toBeCloseTo(r, 9);
+        expect(dist(e.points[0], vertex)).toBeLessThan(1e-9);
+        expect(
+          dist(e.points[1], s.entities[(i + 1) % sides].points[0]),
+        ).toBeLessThan(1e-9);
+      });
+    },
+  );
+
+  it("angled ellipse keeps both radii and aims the major axis", () => {
+    const [center, axisPick, widthPick] = inputs.ellipse,
+      angle = -60,
+      s = make("ellipse", inputs.ellipse, angled(angle)),
+      before = structuredClone(s.entities);
+    solve(s);
+    unchanged(before, s.entities);
+    const e = s.entities[0],
+      axis = sub(e.points[1], e.points[0]),
+      n = normalize({ x: -(axisPick.y - center.y), y: axisPick.x - center.x }),
+      nativeRy = Math.abs(dot(sub(widthPick, center), n));
+    expect(dist(e.points[0], center)).toBeLessThan(1e-9);
+    expect(Math.hypot(axis.x, axis.y)).toBeCloseTo(dist(center, axisPick), 9);
+    expect(Math.atan2(axis.y, axis.x)).toBeCloseTo((angle * Math.PI) / 180, 9);
+    expect(e.ry!).toBeCloseTo(nativeRy, 9);
+  });
+
+  it("angled center arc keeps radius, aim and sweep", () => {
+    const [center, start] = inputs.centerArc,
+      angle = 135,
+      s = make("centerArc", inputs.centerArc, angled(angle)),
+      before = structuredClone(s.entities);
+    solve(s);
+    unchanged(before, s.entities);
+    const info = arcInfo(s.entities[0]);
+    expect(dist(s.entities[0].points[0], center)).toBeLessThan(1e-9);
+    expect(info.r).toBeCloseTo(dist(center, start), 9);
+    expect(info.start).toBeCloseTo((angle * Math.PI) / 180, 9);
+    expect(info.sweep).toBeCloseTo(Math.PI / 2, 9);
+    expect(s.entities[0].ccw).toBe(true);
+  });
+
+  it("angled arc slot keeps both radii, width and sweeps", () => {
+    const angle = 75,
+      s = make("arcSlot", inputs.arcSlot, angled(angle)),
+      plain = make("arcSlot"),
+      before = structuredClone(s.entities);
+    solve(s);
+    unchanged(before, s.entities);
+    const [outer, inner, capStart, capEnd] = s.entities.map(arcInfo),
+      [pOuter, pInner, , pCapEnd] = plain.entities.map(arcInfo);
+    expect(dist(s.entities[0].points[0], inputs.arcSlot[0])).toBeLessThan(1e-9);
+    expect(outer.r).toBeCloseTo(pOuter.r, 9);
+    expect(inner.r).toBeCloseTo(pInner.r, 9);
+    expect(outer.r - inner.r).toBeCloseTo(2 * pCapEnd.r, 9);
+    expect(outer.sweep).toBeCloseTo(pOuter.sweep, 9);
+    expect(inner.sweep).toBeCloseTo(pInner.sweep, 9);
+    expect(capStart.sweep).toBeCloseTo(Math.PI, 9);
+    expect(capEnd.sweep).toBeCloseTo(Math.PI, 9);
+    expect(outer.start).toBeCloseTo((angle * Math.PI) / 180, 9);
+  });
+
+  it("angled slot keeps length, width and cap sweeps", () => {
+    const [a, b] = inputs.slot,
+      angle = 35,
+      s = make("slot", inputs.slot, angled(angle)),
+      plain = make("slot"),
+      before = structuredClone(s.entities);
+    solve(s);
+    unchanged(before, s.entities);
+    const [l1, cap1, , cap2] = s.entities,
+      dir = sub(l1.points[1], l1.points[0]);
+    expect(Math.hypot(dir.x, dir.y)).toBeCloseTo(dist(a, b), 9);
+    expect(Math.atan2(dir.y, dir.x)).toBeCloseTo((angle * Math.PI) / 180, 9);
+    expect(arcInfo(cap1).r).toBeCloseTo(arcInfo(plain.entities[1]).r, 9);
+    expect(arcInfo(cap2).r).toBeCloseTo(arcInfo(plain.entities[3]).r, 9);
+    expect(arcInfo(cap1).sweep).toBeCloseTo(Math.PI, 9);
+    expect(arcInfo(cap2).sweep).toBeCloseTo(Math.PI, 9);
+  });
+
+  it("angled midline stays centered on the first pick", () => {
+    const [a, b] = inputs.midline,
+      s = make("midline", inputs.midline, angled(90)),
+      before = structuredClone(s.entities);
+    solve(s);
+    unchanged(before, s.entities);
+    const [line, mid] = s.entities,
+      dir = sub(line.points[1], line.points[0]);
+    expect(dist(mid.points[0], a)).toBeLessThan(1e-9);
+    expect(Math.atan2(dir.y, dir.x)).toBeCloseTo(Math.PI / 2, 9);
+    expect(Math.hypot(dir.x, dir.y)).toBeCloseTo(2 * dist(a, b), 9);
+  });
 });

@@ -74,6 +74,30 @@ const saved = async (session) => {
     storage,
   );
 };
+// Fixed-count tools commit the final canvas pick without a confirm button;
+// Escape waits until the persisted sketch really contains the new geometry.
+const entityCount = (session) =>
+  session.page.evaluate((key) => {
+    const parsed = JSON.parse(localStorage.getItem(key) ?? "null");
+    return (parsed?.sketches ?? []).reduce(
+      (total, sketch) => total + sketch.entities.length,
+      0,
+    );
+  }, storage);
+const commitEntities = (session, expected) =>
+  session.page.waitForFunction(
+    ({ key, expected }) => {
+      const parsed = JSON.parse(localStorage.getItem(key) ?? "null");
+      return (
+        (parsed?.sketches ?? []).reduce(
+          (total, sketch) => total + sketch.entities.length,
+          0,
+        ) >= expected
+      );
+    },
+    { key: storage, expected },
+    { timeout: 20000 },
+  );
 const metadata = (session) => session.canvas.evaluate((el) => el.__cadViewport);
 const near = (a, b, eps = 1e-5) =>
   assert(
@@ -111,6 +135,12 @@ async function open(doc) {
   await page.goto(url);
   const session = { context, page, canvas: page.getByTestId("cad-canvas") };
   await ready(session);
+  const projectToggle = page.locator(
+    '.app-header button[aria-label="项目管理"]',
+  );
+  if ((await projectToggle.getAttribute("aria-pressed")) === "true")
+    await projectToggle.click();
+  await settle(session);
   return session;
 }
 async function ready(session) {
@@ -308,8 +338,13 @@ try {
           [-9, -17],
           [10, -16],
         ].map(([x, y]) => ({ x, y: clockwise ? -y : y }));
+        // Each second pick auto-commits the current segment and chains the
+        // next one from its endpoint, so the vertex clicks alone draw all
+        // six segments; no per-segment confirmation exists anymore.
+        const before = await entityCount(session);
         for (const point of [...vertices, vertices[0]])
           await click(session, point);
+        await commitEntities(session, before + 6);
         await session.page.keyboard.press("Escape");
         await settle(session);
         let doc = await saved(session);

@@ -190,6 +190,19 @@ async function openFixture(
     undefined,
     { timeout: 120000 },
   );
+  const projects = page.locator('.app-header button[aria-label="项目管理"]');
+  await page.waitForFunction(() => {
+    const button = document.querySelector(
+      '.app-header button[aria-label="项目管理"]',
+    );
+    return button && !button.disabled;
+  });
+  if ((await projects.getAttribute("aria-pressed")) === "true")
+    await projects.click();
+  // Startup panels can resize the canvas after its first frame; fit the settled surface.
+  await settle(page);
+  await page.locator('.view-controls button[title="适配全部"]').click();
+  await settle(page);
   const canvas = page.getByTestId("cad-canvas");
   const viewportState = () =>
     canvas.evaluate((element) => element.__cadViewport);

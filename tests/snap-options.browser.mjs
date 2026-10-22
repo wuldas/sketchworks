@@ -157,6 +157,28 @@ const saved = async (session) => {
     storage,
   );
 };
+const entityCount = (session) =>
+  session.page.evaluate((key) => {
+    const parsed = JSON.parse(localStorage.getItem(key) ?? "null");
+    return (parsed?.sketches ?? []).reduce(
+      (total, sketch) => total + sketch.entities.length,
+      0,
+    );
+  }, storage);
+const commitEntities = (session, expected) =>
+  session.page.waitForFunction(
+    ({ key, expected }) => {
+      const parsed = JSON.parse(localStorage.getItem(key) ?? "null");
+      return (
+        (parsed?.sketches ?? []).reduce(
+          (total, sketch) => total + sketch.entities.length,
+          0,
+        ) >= expected
+      );
+    },
+    { key: storage, expected },
+    { timeout: 20000 },
+  );
 
 async function open(
   fixtureDoc,
@@ -227,6 +249,24 @@ async function open(
       metadata: () => canvas.evaluate((element) => element.__cadViewport),
     };
     await settle(session);
+    const projectToggle = page.locator(
+      '.app-header button[aria-label="项目管理"]',
+    );
+    if ((await projectToggle.getAttribute("aria-pressed")) === "true")
+      await projectToggle.click();
+    await settle(session);
+    if (viewport.width > 700) {
+      const zoomOut = page.locator('.view-controls button[title="缩小"]');
+      await zoomOut.click();
+      await zoomOut.click();
+      const box = await canvas.boundingBox();
+      const from = { x: box.x + box.width * 0.3, y: box.y + box.height * 0.7 };
+      await page.mouse.move(from.x, from.y);
+      await page.mouse.down({ button: "middle" });
+      await page.mouse.move(from.x - 148, from.y, { steps: 5 });
+      await page.mouse.up({ button: "middle" });
+      await settle(session);
+    }
     assert.deepEqual(
       sketch(await saved(session)).entities.map((item) => item.id),
       sketch(fixtureDoc).entities.map((item) => item.id),
@@ -239,6 +279,17 @@ async function open(
   }
 }
 async function screen(session, point) {
+  await session.page.waitForFunction(() => {
+    const canvas = document.querySelector('[data-testid="cad-canvas"]');
+    const frame = canvas?.__cadViewport;
+    const box = canvas?.getBoundingClientRect();
+    return (
+      frame &&
+      box &&
+      Math.abs(frame.width - box.width) < 1 &&
+      Math.abs(frame.height - box.height) < 1
+    );
+  });
   const state = await session.metadata();
   const box = await session.canvas.boundingBox();
   const local = {
@@ -283,7 +334,10 @@ async function clickMoved(session, moved) {
   );
   await settle(session);
 }
-async function finish(session) {
+async function finish(session, expected = null) {
+  // Fixed-count tools commit the final canvas pick without a confirm button;
+  // Escape waits until the persisted sketch really contains the new geometry.
+  if (expected !== null) await commitEntities(session, expected);
   await session.page.keyboard.press("Escape");
   await toolButton(session, names.select).click();
   await settle(session);
@@ -334,7 +388,7 @@ async function drawPoint(session, point, dx = 6, dy = 2) {
     .click();
   const moved = await moveNear(session, point, dx, dy);
   await clickMoved(session, moved);
-  await finish(session);
+  await finish(session, sketch(before).entities.length + 1);
   const doc = await saved(session);
   const ids = new Set(sketch(before).entities.map((item) => item.id));
   const added = sketch(doc).entities.filter((item) => !ids.has(item.id));
@@ -349,7 +403,7 @@ async function drawLine(session, start, end) {
   await clickMoved(session, first);
   const last = await moveNear(session, end);
   await clickMoved(session, last);
-  await finish(session);
+  await finish(session, sketch(before).entities.length + 1);
   const doc = await saved(session);
   const ids = new Set(sketch(before).entities.map((item) => item.id));
   const added = sketch(doc).entities.filter((item) => !ids.has(item.id));
@@ -480,7 +534,7 @@ async function exerciseTangent(session) {
   await capture(session, "tangent", true, true);
   assert.equal((await session.metadata()).snap?.kind, "tangent");
   await clickMoved(session, captured);
-  await finish(session);
+  await finish(session, sketch(before).entities.length + 1);
   const doc = await saved(session);
   const ids = new Set(sketch(before).entities.map((item) => item.id));
   const added = sketch(doc).entities.find((item) => !ids.has(item.id));
@@ -626,12 +680,14 @@ try {
       for (const point of probes)
         assert.equal((await moveNear(session, point)).state.snap, null);
 
-      const target = await moveNear(session, sourceA.points[0]);
+      await moveNear(session, sourceA.points[0]);
       await toolButton(session, names.line).evaluate((element) =>
         element.click(),
       );
       await settle(session);
-      assert.equal((await session.metadata()).snap?.kind, "endpoint");
+      // Entering drawing reserves the right dock and shifts the endpoint on screen.
+      const target = await moveNear(session, sourceA.points[0]);
+      assertSnap(target, "endpoint");
       await session.page.keyboard.press("Escape");
       await settle(session);
       assert.equal((await session.metadata()).snap, null);
@@ -704,6 +760,7 @@ try {
         .click();
 
       await session.page
+        .locator(".ribbon")
         .getByRole("button", { name: "尺寸", exact: true })
         .click();
       assert.equal(
@@ -1135,7 +1192,7 @@ try {
       const last = await moveNear(session, preciseTangent);
       assertSnap(last, "tangent");
       await clickMoved(session, last);
-      await finish(session);
+      await finish(session, sketch(before).entities.length + 1);
       const doc = await saved(session);
       const ids = new Set(sketch(before).entities.map((item) => item.id));
       const added = sketch(doc).entities.find((item) => !ids.has(item.id));

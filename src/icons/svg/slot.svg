@@ -1,0 +1,12 @@
+<!-- Straight slot: outer capsule rotated 45° up-right around the left center.
+     Construction lines removed; both center marks kept axis-aligned. -->
+<svg xmlns="http://www.w3.org/2000/svg" viewBox="0 0 24 24">
+  <path
+    d="M3.604 12.651L12.651 3.604A5.477 5.477 0 0 1 20.396 11.349L11.349 20.396A5.477 5.477 0 0 1 3.604 12.651ZM6.197 16.523H8.756M7.477 15.244V17.803M15.244 7.477H17.803M16.523 6.197V8.756"
+    fill="none"
+    stroke="currentColor"
+    stroke-width="2"
+    stroke-linecap="round"
+    stroke-linejoin="round"
+  />
+</svg>
