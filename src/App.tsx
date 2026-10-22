@@ -1,12 +1,18 @@
-import { useCallback, useEffect, useMemo, useRef, useState } from "react";
-import { flushSync } from "react-dom";
+import {
+  type ComponentType,
+  useCallback,
+  useEffect,
+  useMemo,
+  useRef,
+  useState,
+} from "react";
+import { createPortal, flushSync } from "react-dom";
 import {
   MousePointer2,
   Minus,
   RectangleHorizontal,
   Circle,
   Spline,
-  Waypoints,
   Type,
   MapPin,
   Hexagon,
@@ -29,7 +35,6 @@ import {
   Magnet,
   LockKeyhole,
   Equal,
-  AlignHorizontalJustifyCenter,
   Move,
   Scissors,
   CornerUpRight,
@@ -62,7 +67,6 @@ import {
   AlignHorizontalDistributeCenter,
   AlignVerticalDistributeCenter,
   ArrowDownToLine,
-  type LucideIcon,
 } from "lucide-react";
 import {
   type Document,
@@ -103,6 +107,7 @@ import {
   toolLabels,
   toolClicks,
   createGeometry,
+  creationInputPoints,
   appendGeometry,
 } from "./creation";
 import {
@@ -133,9 +138,30 @@ import {
   projectFileName,
   type CadProject,
 } from "./projectArchive";
-import { virtualFiles, ROOT_ID, type VfsFileEntry } from "./virtualFileSystem";
+import {
+  virtualFiles,
+  ROOT_ID,
+  type VfsEntry,
+  type VfsFileEntry,
+} from "./virtualFileSystem";
 import { useProjectWorkspace } from "./useProjectWorkspace";
 import { appendSplinePoint } from "./splineDraft";
+import {
+  Arc3PointIcon,
+  ArcCenterIcon,
+  BezierIcon,
+  ChamferIcon,
+  FilletIcon,
+  HorizontalIcon,
+  MirrorIcon,
+  OffsetIcon,
+  ParallelIcon,
+  PerpendicularIcon,
+  SlotIcon,
+  TangentIcon,
+  VerticalIcon,
+  type CadIconProps,
+} from "./icons";
 import {
   defaultSnapOptions,
   type SnapOptions,
@@ -158,6 +184,8 @@ import {
   type DragDriver,
 } from "./dragTransaction";
 import { ParameterPanel } from "./ParameterPanel";
+import { CreationPanel } from "./CreationPanel";
+import { creationMethods } from "./creationWorkflow";
 import {
   type CommandSession,
   commandGeometryError,
@@ -178,39 +206,48 @@ const DIRECTION_CONSTRAINTS: ConstraintKind[] = [
   "collinear",
   "angle",
 ];
-const toolIcons: Record<Tool, LucideIcon> = {
+type IconComponent = ComponentType<{ size?: number; className?: string }>;
+
+function monoTone(Icon: ComponentType<CadIconProps>): IconComponent {
+  const ThemedIcon = (props: CadIconProps) => <Icon {...props} tone="mono" />;
+  ThemedIcon.displayName = `Mono(${Icon.displayName ?? "CadIcon"})`;
+  return ThemedIcon;
+}
+
+const toolIcons: Record<Tool, IconComponent> = {
   select: MousePointer2,
   line: Minus,
   midline: AlignHorizontalDistributeCenter,
   rectangle: RectangleHorizontal,
+  threeRectangle: RectangleHorizontal,
   centerRectangle: Square,
   circle: Circle,
   threeCircle: CircleDot,
-  arc: CornerUpRight,
-  centerArc: CircleDashed,
+  arc: Arc3PointIcon,
+  centerArc: ArcCenterIcon,
   polygon: Hexagon,
   ellipse: Circle,
-  slot: RectangleHorizontal,
+  slot: SlotIcon,
   arcSlot: GitMerge,
   spline: Spline,
-  bezier: Waypoints,
+  bezier: BezierIcon,
   conic: GitBranch,
   point: MapPin,
   text: Type,
 };
-const constraintIcons: Record<ConstraintKind, LucideIcon> = {
+const constraintIcons: Record<ConstraintKind, IconComponent> = {
   coincident: GitMerge,
-  horizontal: Minus,
-  vertical: AlignVerticalDistributeCenter,
-  parallel: AlignHorizontalJustifyCenter,
-  perpendicular: CornerUpRight,
+  horizontal: monoTone(HorizontalIcon),
+  vertical: monoTone(VerticalIcon),
+  parallel: monoTone(ParallelIcon),
+  perpendicular: monoTone(PerpendicularIcon),
   equal: Equal,
   fixed: LockKeyhole,
   onLine: ArrowDownToLine,
   onCurve: Spline,
   intersection: Crosshair,
   origin: Crosshair,
-  tangent: Tangent,
+  tangent: monoTone(TangentIcon),
   concentric: CircleDot,
   midpoint: AlignHorizontalDistributeCenter,
   symmetric: FlipHorizontal2,
@@ -224,11 +261,11 @@ const constraintIcons: Record<ConstraintKind, LucideIcon> = {
   diameter: Circle,
   angle: Triangle,
 };
-const operationIcons: Record<string, LucideIcon> = {
-  fillet: CornerUpRight,
-  chamfer: Triangle,
+const operationIcons: Record<string, IconComponent> = {
+  fillet: FilletIcon,
+  chamfer: ChamferIcon,
   blend: Spline,
-  offset: Copy,
+  offset: OffsetIcon,
   trim: Scissors,
   extend: CornerUpRight,
   break: Unlink,
@@ -236,7 +273,7 @@ const operationIcons: Record<string, LucideIcon> = {
   move: Move,
   rotate: RotateCw,
   copy: Copy,
-  mirror: FlipHorizontal2,
+  mirror: MirrorIcon,
   rectangularArray: Grid3X3,
   circularArray: CircleDashed,
   detach: Unlink,
@@ -281,7 +318,7 @@ function IconButton({
   onClick,
   className = "",
 }: {
-  icon: LucideIcon;
+  icon: IconComponent;
   title: string;
   active?: boolean;
   disabled?: boolean;
@@ -410,7 +447,7 @@ function MenuItem({
   onClick,
   disabled = false,
 }: {
-  icon: LucideIcon;
+  icon: IconComponent;
   label: string;
   shortcut?: string;
   onClick: () => void;
@@ -424,6 +461,19 @@ function MenuItem({
     </button>
   );
 }
+type ProjectTab = {
+  id: string;
+  fileId: string | null;
+  name: string;
+};
+type UntitledSnapshot = {
+  document: Document;
+  project: CadProject;
+};
+const UNTITLED_TAB_ID = "untitled";
+const isFileEntry = (entry: VfsEntry | undefined): entry is VfsFileEntry =>
+  entry?.kind === "file";
+
 function initialDocument(): Document {
   try {
     const stored = localStorage.getItem(STORAGE);
@@ -446,6 +496,9 @@ export default function App() {
     [drafts, setDrafts] = useState<XY[]>([]),
     draftSnaps = useRef<(SnapReference | undefined)[]>([]),
     draftCaptured = useRef(false);
+  const [creationActive, setCreationActive] = useState(0);
+  const [creationInputsValid, setCreationInputsValid] = useState(true);
+  const [creationPickRevision, setCreationPickRevision] = useState(0);
   const [config, setConfig] = useState<CreateConfig>(defaultConfig),
     [ready, setReady] = useState(false),
     [solverState, setSolverState] = useState<SolverResult>({
@@ -462,9 +515,13 @@ export default function App() {
     [menu, setMenu] = useState<string | null>(null),
     [modal, setModal] = useState<Modal | null>(null),
     [fileManager, setFileManager] = useState<"browse" | "save" | null>(null),
+    [fileManagerLocked, setFileManagerLocked] = useState(false),
+    [projectTransition, setProjectTransition] = useState<string | null>(null),
     [toast, setToast] = useState<{ text: string; error: boolean } | null>(null),
     [saved, setSaved] = useState(false),
     [historyVersion, setHistoryVersion] = useState(0),
+    [projectTabs, setProjectTabs] = useState<ProjectTab[]>([]),
+    [activeTabId, setActiveTabId] = useState<string | null>(null),
     [leftOpen, setLeftOpen] = useState(window.innerWidth > 960),
     [rightOpen, setRightOpen] = useState(window.innerWidth > 1100),
     [command, setCommand] = useState<CommandSession | null>(null),
@@ -489,6 +546,7 @@ export default function App() {
     [selectedDimensionId, setSelectedDimensionId] = useState<string | null>(
       null,
     );
+  const projectTransitionRef = useRef(false);
   const history = useRef<Document[]>([]),
     future = useRef<Document[]>([]),
     dragBefore = useRef<Document | null>(null),
@@ -502,6 +560,11 @@ export default function App() {
     } | null>(null),
     fileInput = useRef<HTMLInputElement>(null),
     toastTimer = useRef<ReturnType<typeof setTimeout>>(undefined);
+  const activeTabRef = useRef<string | null>(null);
+  const untitledSnapshots = useRef(new Map<string, UntitledSnapshot>());
+  const untitledCounter = useRef(1);
+  const tabsInitialized = useRef(false);
+  const defaultProjectPanelOpened = useRef(false);
   const sketch = doc.sketches.find((s) => s.id === activeId) ?? doc.sketches[0];
   const dimensionAdjustment = dimensionAdjustmentId
     ? sketch.constraints.find((c) => c.id === dimensionAdjustmentId)
@@ -521,6 +584,24 @@ export default function App() {
   const unit = doc.unit === "in" ? "in" : "mm",
     factor = doc.unit === "in" ? 25.4 : 1;
   const formatted = (n: number) => Number((n / factor).toFixed(3)).toString();
+  const creationError = useMemo(() => {
+    if (tool === "select") return null;
+    const required = tool === "spline" ? 2 : toolClicks[tool];
+    if (drafts.length < required)
+      return `请先拾取 ${required} 个点，或填写对应坐标`;
+    try {
+      const geometry = createGeometry(tool, drafts, config);
+      validGeometry({
+        id: "creation",
+        name: "创建预览",
+        visible: true,
+        ...geometry,
+      });
+      return null;
+    } catch (error) {
+      return (error as Error).message;
+    }
+  }, [tool, drafts, config]);
   const notify = useCallback((text: string, error = false) => {
     setToast({ text, error });
     clearTimeout(toastTimer.current);
@@ -657,6 +738,13 @@ export default function App() {
   const setMode = (mode: Tool, restoreSelection = true) => {
     setTool(mode);
     setDrafts([]);
+    setCreationActive(0);
+    setCreationPickRevision((version) => version + 1);
+    setConfig((previous) =>
+      previous.angle === undefined
+        ? previous
+        : { ...previous, angle: undefined },
+    );
     draftSnaps.current = [];
     draftCaptured.current = false;
     if (!restoreSelection) setSelection([]);
@@ -684,10 +772,7 @@ export default function App() {
     setActiveId(previousSk);
     commit(previous, "撤销", false);
     setHistoryVersion((v) => v + 1);
-    setCommand(null);
-    cancelDimensions();
-    setSelection([]);
-    setDrafts([]);
+    setMode("select", false);
   };
   const redo = () => {
     const next = future.current.pop();
@@ -700,9 +785,7 @@ export default function App() {
     );
     commit(next, "重做", false);
     setHistoryVersion((v) => v + 1);
-    setCommand(null);
-    cancelDimensions();
-    setSelection([]);
+    setMode("select", false);
   };
   const removeSelectedDimension = () => {
     const id = selectedDimensionId;
@@ -744,6 +827,94 @@ export default function App() {
       cancelDimensions();
     }
   };
+  const projectTabName = (document: Document) =>
+    document.name?.trim() || "未命名草图";
+  const projectFileTabName = (file: VfsFileEntry) =>
+    file.name.replace(/\.(?:swcad|asar|json)$/i, "") || "未命名项目";
+  const nextUntitledId = () => `untitled-${++untitledCounter.current}`;
+  const nextUntitledName = () => {
+    const names = new Set(projectTabs.map((tab) => tab.name));
+    if (!names.has("未命名草图")) return "未命名草图";
+    let index = 2;
+    while (names.has(`未命名草图 ${index}`)) index += 1;
+    return `未命名草图 ${index}`;
+  };
+  const upsertProjectTab = (tab: ProjectTab) =>
+    setProjectTabs((current) => {
+      if (!current.some((item) => item.id === tab.id)) return [...current, tab];
+      return current.map((item) =>
+        item.id === tab.id
+          ? { ...item, name: tab.name, fileId: tab.fileId }
+          : item,
+      );
+    });
+  const markProjectTabActive = (id: string) => {
+    activeTabRef.current = id;
+    setActiveTabId(id);
+  };
+  const rememberUntitledProject = () => {
+    if (workspace.activeFile) return;
+    const id = activeTabRef.current ?? UNTITLED_TAB_ID;
+    untitledSnapshots.current.set(id, {
+      document: clone(docRef.current),
+      project: clone(workspace.currentProject()),
+    });
+  };
+  const restoreUntitledProject = (snapshot: UntitledSnapshot) => {
+    const next = clone(snapshot.document);
+    if (!commit(next, "切换项目", false)) return false;
+    history.current = [];
+    future.current = [];
+    setHistoryVersion((value) => value + 1);
+    workspace.detach(clone(next), clone(snapshot.project));
+    switchSketch(next.sketches[0].id);
+    setFitKey((value) => value + 1);
+    return true;
+  };
+  const registerUntitledTab = (name?: string) => {
+    const active = projectTabs.find((tab) => tab.id === activeTabRef.current);
+    const id = active && active.fileId === null ? active.id : nextUntitledId();
+    untitledSnapshots.current.set(id, {
+      document: clone(docRef.current),
+      project: clone(workspace.currentProject()),
+    });
+    upsertProjectTab({
+      id,
+      fileId: null,
+      name: name?.trim() || projectTabName(docRef.current),
+    });
+    markProjectTabActive(id);
+  };
+  useEffect(() => {
+    if (!workspace.ready || tabsInitialized.current) return;
+    tabsInitialized.current = true;
+    const file = workspace.activeFile;
+    if (file) {
+      upsertProjectTab({
+        id: file.id,
+        fileId: file.id,
+        name: projectFileTabName(file),
+      });
+      markProjectTabActive(file.id);
+      return;
+    }
+    untitledSnapshots.current.set(UNTITLED_TAB_ID, {
+      document: clone(docRef.current),
+      project: clone(workspace.currentProject()),
+    });
+    upsertProjectTab({
+      id: UNTITLED_TAB_ID,
+      fileId: null,
+      name: projectTabName(docRef.current),
+    });
+    markProjectTabActive(UNTITLED_TAB_ID);
+  }, [workspace.ready]);
+  useEffect(() => {
+    if (!workspace.ready || defaultProjectPanelOpened.current) return;
+    defaultProjectPanelOpened.current = true;
+    if (window.innerWidth > 960)
+      setFileManager((current) => current ?? "browse");
+  }, [workspace.ready]);
   const openFileManager = (mode: "browse" | "save" = "browse") => {
     if (!workspace.ready) {
       notify("项目存储正在打开，请稍后操作", true);
@@ -752,6 +923,7 @@ export default function App() {
     cancel();
     setModal(null);
     setMenu(null);
+    setLeftOpen(true);
     setFileManager(mode);
   };
   const saveProject = async () => {
@@ -800,10 +972,14 @@ export default function App() {
       notify("求解器正在加载", true);
       return false;
     }
+    if (projectTransitionRef.current) return false;
+    projectTransitionRef.current = true;
+    setProjectTransition("正在打开项目");
     try {
+      rememberUntitledProject();
       await workspace.persist();
       const latestFile = await virtualFiles.get(file.id);
-      if (!latestFile || latestFile.kind !== "file")
+      if (!latestFile || !isFileEntry(latestFile))
         throw new Error("项目文件已不存在");
       const contents = await virtualFiles.readFile(file.id);
       const project = /\.json$/i.test(latestFile.name)
@@ -815,22 +991,235 @@ export default function App() {
       setHistoryVersion((value) => value + 1);
       switchSketch(docRef.current.sketches[0].id);
       setFitKey((value) => value + 1);
-      workspace.attach({ ...latestFile, kind: "file" }, project);
+      workspace.attach(latestFile, project);
+      upsertProjectTab({
+        id: latestFile.id,
+        fileId: latestFile.id,
+        name: projectFileTabName(latestFile),
+      });
+      markProjectTabActive(latestFile.id);
+      setFileManager("browse");
       notify("项目已打开");
       return true;
-    } catch (error) {
-      notify(`打开项目失败：${(error as Error).message}`, true);
-      return false;
+    } finally {
+      projectTransitionRef.current = false;
+      setProjectTransition(null);
+    }
+  };
+  const createVirtualProject = async (name: string, parentId: string) => {
+    if (!ready || !workspace.ready)
+      throw new Error("项目存储正在准备，请稍后操作");
+    if (projectTransitionRef.current)
+      throw new Error("正在切换项目，请稍后操作");
+    projectTransitionRef.current = true;
+    setProjectTransition("正在创建项目");
+    try {
+      rememberUntitledProject();
+      await workspace.persist();
+      const next = emptyDocument();
+      next.name = name.replace(/\.swcad$/i, "");
+      const project = createProject(next);
+      const contents = new Blob([Uint8Array.from(encodeProject(project))], {
+        type: "application/octet-stream",
+      });
+      const file = await virtualFiles.createFile(parentId, name, contents);
+      if (!commit(next, "新建项目", false)) {
+        await virtualFiles.remove(file.id);
+        return undefined;
+      }
+      history.current = [];
+      future.current = [];
+      setHistoryVersion((value) => value + 1);
+      switchSketch(next.sketches[0].id);
+      setFitKey((value) => value + 1);
+      workspace.attach(file, project);
+      upsertProjectTab({
+        id: file.id,
+        fileId: file.id,
+        name: projectFileTabName(file),
+      });
+      markProjectTabActive(file.id);
+      setFileManager("browse");
+      notify("项目已创建");
+      return file;
+    } finally {
+      projectTransitionRef.current = false;
+      setProjectTransition(null);
     }
   };
   const saveVirtualProject = (file: VfsFileEntry, project: CadProject) => {
+    const previousId = activeTabRef.current;
+    const previousTab = projectTabs.find((tab) => tab.id === previousId);
+    if (previousId && previousTab && previousTab.fileId === null) {
+      setProjectTabs((current) =>
+        current.filter((tab) => tab.id !== previousId),
+      );
+      untitledSnapshots.current.delete(previousId);
+    }
     workspace.attach(file, project);
-    notify("项目已保存到文件管理器");
+    upsertProjectTab({
+      id: file.id,
+      fileId: file.id,
+      name: projectFileTabName(file),
+    });
+    markProjectTabActive(file.id);
+    setFileManager("browse");
+    notify("项目已保存到项目管理");
   };
   const refreshVirtualFiles = () => {
-    void workspace
-      .refresh()
-      .catch((error) => notify((error as Error).message, true));
+    void (async () => {
+      try {
+        await workspace.refresh();
+        const entries = await virtualFiles.allEntries();
+        const activeId = activeTabRef.current;
+        const activeTab = projectTabs.find((tab) => tab.id === activeId);
+        const activeEntry = activeId
+          ? entries.find((entry) => entry.id === activeId)
+          : undefined;
+        setProjectTabs((current) =>
+          current.flatMap((tab) => {
+            if (!tab.fileId) return [tab];
+            const entry = entries.find(
+              (candidate): candidate is VfsFileEntry =>
+                candidate.id === tab.fileId && candidate.kind === "file",
+            );
+            if (!entry) return [];
+            return [
+              {
+                ...tab,
+                name: projectFileTabName(entry),
+              },
+            ];
+          }),
+        );
+        if (activeId && activeTab?.fileId && !activeEntry) {
+          const id = nextUntitledId();
+          untitledSnapshots.current.set(id, {
+            document: clone(docRef.current),
+            project: clone(workspace.currentProject()),
+          });
+          upsertProjectTab({
+            id,
+            fileId: null,
+            name: projectTabName(docRef.current),
+          });
+          markProjectTabActive(id);
+        }
+      } catch (error) {
+        notify((error as Error).message, true);
+      }
+    })();
+  };
+  const activateProjectTab = async (tab: ProjectTab) => {
+    if (tab.id === activeTabRef.current) return false;
+    if (!workspace.ready || projectTransitionRef.current) return false;
+    if (tab.fileId) {
+      const file = await virtualFiles.get(tab.fileId);
+      if (!isFileEntry(file)) {
+        setProjectTabs((current) =>
+          current.filter((item) => item.id !== tab.id),
+        );
+        notify("项目文件已不存在", true);
+        return false;
+      }
+      return openVirtualProject(file);
+    }
+    projectTransitionRef.current = true;
+    setProjectTransition("正在切换项目");
+    try {
+      await workspace.persist();
+      let snapshot = untitledSnapshots.current.get(tab.id);
+      if (!snapshot) {
+        const fresh = emptyDocument();
+        fresh.name = tab.name || "未命名草图";
+        snapshot = { document: fresh, project: createProject(fresh) };
+        untitledSnapshots.current.set(tab.id, snapshot);
+      }
+      if (!restoreUntitledProject(snapshot)) return false;
+      upsertProjectTab({
+        id: tab.id,
+        fileId: null,
+        name: projectTabName(snapshot.document),
+      });
+      markProjectTabActive(tab.id);
+      return true;
+    } catch (error) {
+      notify(`切换项目失败：${(error as Error).message}`, true);
+      return false;
+    } finally {
+      projectTransitionRef.current = false;
+      setProjectTransition(null);
+    }
+  };
+  const closeProjectTab = async (tab: ProjectTab) => {
+    if (projectTransitionRef.current) return;
+    const index = projectTabs.findIndex((item) => item.id === tab.id);
+    if (index < 0) return;
+    const remaining = projectTabs.filter((item) => item.id !== tab.id);
+    if (activeTabRef.current === tab.id) {
+      if (!remaining.length) {
+        try {
+          await workspace.persist();
+        } catch {
+          return;
+        }
+        const fresh = emptyDocument();
+        if (!commit(fresh, "新建", false)) return;
+        history.current = [];
+        future.current = [];
+        setHistoryVersion((value) => value + 1);
+        workspace.detach(docRef.current);
+        untitledSnapshots.current.clear();
+        untitledSnapshots.current.set(UNTITLED_TAB_ID, {
+          document: clone(docRef.current),
+          project: clone(workspace.currentProject()),
+        });
+        switchSketch(docRef.current.sketches[0].id);
+        setFitKey((value) => value + 1);
+        const freshTab: ProjectTab = {
+          id: UNTITLED_TAB_ID,
+          fileId: null,
+          name: projectTabName(docRef.current),
+        };
+        setProjectTabs([freshTab]);
+        markProjectTabActive(UNTITLED_TAB_ID);
+        return;
+      }
+      const next = remaining[Math.min(index, remaining.length - 1)];
+      if (!(await activateProjectTab(next))) return;
+    }
+    setProjectTabs((current) => current.filter((item) => item.id !== tab.id));
+    if (tab.fileId === null) untitledSnapshots.current.delete(tab.id);
+  };
+  const addUntitledProject = async () => {
+    if (!workspace.ready || projectTransitionRef.current) return;
+    projectTransitionRef.current = true;
+    setProjectTransition("正在新建项目");
+    try {
+      await workspace.persist();
+      rememberUntitledProject();
+      const next = emptyDocument();
+      next.name = nextUntitledName();
+      if (!commit(next, "新建", false)) return;
+      history.current = [];
+      future.current = [];
+      setHistoryVersion((value) => value + 1);
+      workspace.detach(docRef.current);
+      switchSketch(next.sketches[0].id);
+      setFitKey((value) => value + 1);
+      const id = nextUntitledId();
+      untitledSnapshots.current.set(id, {
+        document: clone(docRef.current),
+        project: clone(workspace.currentProject()),
+      });
+      upsertProjectTab({ id, fileId: null, name: next.name });
+      markProjectTabActive(id);
+    } catch (error) {
+      notify(`新建项目失败：${(error as Error).message}`, true);
+    } finally {
+      projectTransitionRef.current = false;
+      setProjectTransition(null);
+    }
   };
   const saveJson = () => {
     download(`${doc.name}.sketch.json`, exportJson(doc), "application/json");
@@ -839,13 +1228,18 @@ export default function App() {
   };
   useEffect(() => {
     const handler = (e: KeyboardEvent) => {
-      if (
-        (e.target as HTMLElement)?.matches("input,textarea,select") ||
-        modal ||
-        fileManager
-      )
+      if (projectTransitionRef.current) return;
+      if ((e.target as HTMLElement)?.matches("input,textarea,select") || modal)
         return;
       const key = e.key.toLowerCase();
+      if ((e.ctrlKey || e.metaKey) && key === "s") {
+        e.preventDefault();
+        if (e.shiftKey) openFileManager("save");
+        else void saveProject();
+        return;
+      }
+      if ((e.target as HTMLElement)?.closest('[data-testid="file-manager"]'))
+        return;
       if (command) {
         if (key === "escape") {
           e.preventDefault();
@@ -874,10 +1268,6 @@ export default function App() {
       } else if ((e.ctrlKey || e.metaKey) && key === "o") {
         e.preventDefault();
         openFileManager("browse");
-      } else if ((e.ctrlKey || e.metaKey) && key === "s") {
-        e.preventDefault();
-        if (e.shiftKey) openFileManager("save");
-        else void saveProject();
       } else if ((e.ctrlKey || e.metaKey) && key === "a") {
         e.preventDefault();
         setSelection(sketch.entities.map((e) => ({ entityId: e.id })));
@@ -888,8 +1278,12 @@ export default function App() {
       } else if (key === "delete" || key === "backspace") {
         e.preventDefault();
         removeSelected();
-      } else if (key === "enter" && tool === "spline") finishSpline();
-      else if (!e.ctrlKey && !e.metaKey) {
+      } else if (key === "enter" && tool === "spline") {
+        e.preventDefault();
+        document
+          .querySelector<HTMLFormElement>('[data-testid="creation-panel"]')
+          ?.requestSubmit();
+      } else if (!e.ctrlKey && !e.metaKey) {
         // Tool shortcuts must not type their letter into a freshly opened editor.
         const shortcuts: Record<string, () => void> = {
           l: () => setMode("line"),
@@ -1324,6 +1718,14 @@ export default function App() {
   ) => {
     let result: ReturnType<typeof createGeometry>;
     try {
+      const effective = creationInputPoints(mode, points, config);
+      if (effective !== points) {
+        snaps = snaps.map((ref, index) =>
+          dist(points[index], effective[index]) < 1e-7 ? ref : undefined,
+        );
+        points = effective;
+        preserveCapturedCoordinates = true;
+      }
       result = createGeometry(mode, points, {
         ...config,
         preserveCapturedCoordinates,
@@ -1348,39 +1750,91 @@ export default function App() {
     if (ok) setSelection([]);
     return ok;
   };
-  const place = (p: XY, snapRef?: SnapReference, captured = false) => {
-    if (tool === "select" || !ready) return;
-    if (tool === "spline") {
-      const next = appendSplinePoint(drafts, draftSnaps.current, p, snapRef);
-      setDrafts(next.points);
-      draftSnaps.current = next.refs;
-      return;
-    }
-    const points = [...drafts, p],
-      snaps = [...draftSnaps.current, snapRef];
-    const preserveCapturedCoordinates = draftCaptured.current || captured;
-    if (points.length >= toolClicks[tool]) {
-      if (finishCreation(points, snaps, tool, preserveCapturedCoordinates)) {
-        if (tool === "line") {
-          const endpoint = docRef.current.sketches
-            .find((s) => s.id === activeId)!
-            .entities.at(-1)!.points[1];
-          setDrafts([{ x: endpoint.x, y: endpoint.y }]);
-          draftSnaps.current = [endpoint.id];
-          draftCaptured.current = captured;
-        } else {
-          setDrafts([]);
-          draftSnaps.current = [];
-          draftCaptured.current = false;
-        }
-      }
+  const completeCreation = (
+    points = drafts,
+    snaps = draftSnaps.current,
+    captured = draftCaptured.current,
+  ) => {
+    if (
+      tool === "select" ||
+      !creationInputsValid ||
+      points.length < toolClicks[tool]
+    )
+      return false;
+    if (!finishCreation(points, snaps, tool, captured)) return false;
+    setCreationPickRevision((version) => version + 1);
+    if (tool === "line") {
+      const endpoint = docRef.current.sketches
+        .find((s) => s.id === activeId)!
+        .entities.at(-1)!.points[1];
+      setDrafts([{ x: endpoint.x, y: endpoint.y }]);
+      draftSnaps.current = [endpoint.id];
+      draftCaptured.current = true;
+      setCreationActive(1);
     } else {
-      setDrafts(points);
-      draftSnaps.current = snaps;
-      draftCaptured.current = preserveCapturedCoordinates;
+      setDrafts([]);
+      draftSnaps.current = [];
+      draftCaptured.current = false;
+      setCreationActive(0);
     }
+    return true;
+  };
+  const place = (p: XY, snapRef?: SnapReference, captured = false) => {
+    if (tool === "select" || !ready) return false;
+    if (!creationInputsValid) {
+      notify("请先修正绘制参数", true);
+      return false;
+    }
+    const index = Math.min(creationActive, drafts.length);
+    const next =
+      tool === "spline" && index === drafts.length
+        ? appendSplinePoint(drafts, draftSnaps.current, p, snapRef)
+        : {
+            points: [...drafts.slice(0, index), p, ...drafts.slice(index + 1)],
+            refs: [
+              ...draftSnaps.current.slice(0, index),
+              snapRef,
+              ...draftSnaps.current.slice(index + 1),
+            ],
+          };
+    setDrafts(next.points);
+    setCreationPickRevision((version) => version + 1);
+    draftSnaps.current = next.refs;
+    draftCaptured.current ||= captured;
+    if (
+      tool !== "spline" &&
+      next.points.length >= toolClicks[tool] &&
+      completeCreation(next.points, next.refs, draftCaptured.current)
+    )
+      return true;
+    setCreationActive(Math.min(next.points.length, toolClicks[tool] - 1));
+    return true;
+  };
+  const changeCreationPoint = (index: number, point: XY) => {
+    if (
+      index > drafts.length ||
+      !Number.isFinite(point.x) ||
+      !Number.isFinite(point.y)
+    )
+      return;
+    const points = [
+      ...drafts.slice(0, index),
+      point,
+      ...drafts.slice(index + 1),
+    ];
+    setDrafts(points);
+    draftSnaps.current[index] = undefined;
+    draftCaptured.current = true;
+    setCreationActive(Math.min(points.length, toolClicks[tool] - 1));
+  };
+  const truncateCreation = (index: number) => {
+    setDrafts(drafts.slice(0, index));
+    draftSnaps.current = draftSnaps.current.slice(0, index);
+    if (index === 0) draftCaptured.current = false;
+    setCreationActive(index);
   };
   const finishSpline = (point?: XY, snapRef?: SnapReference) => {
+    if (!creationInputsValid) return;
     const final = point
       ? appendSplinePoint(drafts, draftSnaps.current, point, snapRef)
       : { points: drafts, refs: draftSnaps.current };
@@ -1390,6 +1844,8 @@ export default function App() {
       finishCreation(final.points, final.refs)
     ) {
       setDrafts([]);
+      setCreationPickRevision((version) => version + 1);
+      setCreationActive(0);
       draftSnaps.current = [];
       draftCaptured.current = false;
     }
@@ -1809,6 +2265,7 @@ export default function App() {
             future.current = [];
             setHistoryVersion((value) => value + 1);
             workspace.detach(docRef.current);
+            registerUntitledTab(next.name);
             switchSketch(next.sketches[0].id);
             setFitKey((v) => v + 1);
             return true;
@@ -1978,63 +2435,6 @@ export default function App() {
         }),
     });
   };
-  const openToolConfig = (mode: Tool) => {
-    setMode(mode);
-    if (["polygon", "text", "conic"].includes(mode)) {
-      const fields =
-        mode === "polygon"
-          ? [
-              field("sides", "边数", config.sides, ""),
-              {
-                key: "polygonOuter",
-                label: "模式",
-                value: config.polygonOuter ? "外接" : "内接",
-                type: "select" as const,
-                options: ["内接", "外接"],
-              },
-            ]
-          : mode === "text"
-            ? [
-                { key: "text", label: "文本", value: config.text },
-                field("fontSize", "高度", Number(formatted(config.fontSize))),
-              ]
-            : [field("weight", "权重", config.weight, "")];
-      setModal({
-        title: toolLabels[mode],
-        fields,
-        confirm: (values) => {
-          try {
-            const next = { ...config };
-            if (values.sides) {
-              next.sides = Number(values.sides);
-              if (
-                !Number.isInteger(next.sides) ||
-                next.sides < 3 ||
-                next.sides > 100
-              )
-                throw new Error("边数范围为 3–100");
-              next.polygonOuter = values.polygonOuter === "外接";
-            }
-            if (values.text !== undefined) {
-              next.text = values.text;
-              next.fontSize = Number(values.fontSize) * factor;
-              if (!next.text.trim() || !(next.fontSize > 0))
-                throw new Error("内容和高度无效");
-            }
-            if (values.weight) {
-              next.weight = Number(values.weight);
-              if (!(next.weight > 0)) throw new Error("权重必须为正");
-            }
-            setConfig(next);
-            return true;
-          } catch (error) {
-            notify((error as Error).message, true);
-            return false;
-          }
-        },
-      });
-    }
-  };
   const menuToggle = (name: string) => setMenu(menu === name ? null : name);
   const constraintKinds: ConstraintKind[] = [
     "coincident",
@@ -2053,7 +2453,8 @@ export default function App() {
   ];
   return (
     <div
-      className={`app ${leftOpen ? "" : "left-closed"} ${rightOpen ? "" : "right-closed"}`}
+      className={`app ${tool !== "select" ? "creation-mode" : ""} ${leftOpen ? "" : "left-closed"} ${rightOpen || tool !== "select" ? "" : "right-closed"}`}
+      inert={projectTransition !== null}
       data-history={historyVersion}
     >
       <header className="app-header">
@@ -2065,16 +2466,28 @@ export default function App() {
           <strong>SketchWorks</strong>
           <span className="brand-tag">CAD</span>
         </div>
+        <button
+          type="button"
+          className="header-action"
+          aria-label="项目管理"
+          aria-pressed={fileManager !== null}
+          title="项目管理 (Ctrl+O)"
+          disabled={!workspace.ready || fileManagerLocked}
+          onClick={() =>
+            fileManager ? setFileManager(null) : openFileManager("browse")
+          }
+        >
+          <FolderOpen size={15} />
+          <span>项目管理</span>
+        </button>
         <div className="document-title">
           <FileJson size={16} />
-          <input
-            aria-label="文档名称"
+          <strong
+            className="document-name"
             title={workspace.activeFile?.name ?? doc.name}
-            value={doc.name}
-            onChange={(e) =>
-              setDoc({ ...docRef.current, name: e.target.value })
-            }
-          />
+          >
+            {doc.name || "未命名草图"}
+          </strong>
           <span className="save-dot" data-saved={saved} />
         </div>
         <div className="header-right">
@@ -2085,12 +2498,6 @@ export default function App() {
                 ? "本地已保存"
                 : "未保存"}
           </span>
-          <IconButton
-            icon={FolderOpen}
-            title="文件管理器"
-            disabled={!workspace.ready}
-            onClick={() => openFileManager("browse")}
-          />
           <a
             className="header-link"
             href={`${import.meta.env.BASE_URL}THIRD_PARTY_NOTICES.txt`}
@@ -2121,919 +2528,1041 @@ export default function App() {
           </button>
         </div>
       </header>
-      <nav className="workspace-tabs">
-        <div className="file-menu-wrap">
-          <button
-            className="file-menu-toggle"
-            onClick={() => menuToggle("file")}
-          >
-            <FileJson size={15} />
-            文件
-            <ChevronDown size={12} />
-          </button>
-          {menu === "file" && (
-            <div className="menu file-menu">
-              <MenuItem
-                icon={FolderOpen}
-                label="文件管理器"
-                shortcut="Ctrl O"
-                onClick={() => openFileManager("browse")}
-              />
-              <div className="menu-divider" />
-              <MenuItem
-                icon={FilePlus2}
-                label="新建文档"
-                onClick={() => newDocument()}
-              />
-              <MenuItem
-                icon={FolderOpen}
-                label="打开草图"
-                onClick={() => {
-                  fileInput.current?.click();
-                  setMenu(null);
-                }}
-              />
-              <MenuItem
-                icon={Save}
-                label="保存草图"
-                shortcut="Ctrl S"
-                onClick={() => void saveProject()}
-              />
-              <MenuItem
-                icon={Save}
-                label="项目另存为"
-                shortcut="Ctrl Shift S"
-                onClick={() => openFileManager("save")}
-              />
-              <MenuItem
-                icon={Download}
-                label="下载项目"
-                onClick={downloadProject}
-              />
-              <MenuItem
-                icon={FileJson}
-                label="导出 JSON 草图"
-                onClick={saveJson}
-              />
-              <div className="menu-divider" />
-              <MenuItem
-                icon={Hexagon}
-                label="打开连接板示例"
-                onClick={() => newDocument(true)}
-              />
-              <MenuItem
-                icon={Download}
-                label="导出 DXF / SVG / PDF"
-                onClick={openExport}
-              />
-            </div>
-          )}
-        </div>
-        <button className="workspace-tab selected">草图</button>
-        <div className="tab-spacer" />
-        <IconButton
-          icon={Undo2}
-          title="撤销 (Ctrl+Z)"
-          disabled={!history.current.length}
-          onClick={undo}
-        />
-        <IconButton
-          icon={Redo2}
-          title="重做 (Ctrl+Shift+Z)"
-          disabled={!future.current.length}
-          onClick={redo}
-        />
-        <div className="tab-divider" />
-        <IconButton
-          icon={PanelLeftClose}
-          title="切换浏览器"
-          active={!leftOpen}
-          onClick={() => setLeftOpen(!leftOpen)}
-        />
-        <IconButton
-          icon={PanelRightClose}
-          title="切换属性面板"
-          active={!rightOpen}
-          onClick={() => setRightOpen(!rightOpen)}
-        />
-      </nav>
-      <div className="ribbon">
-        <div className="ribbon-group select-group">
-          <button
-            className={`ribbon-tool ${tool === "select" && !command ? "selected" : ""}`}
-            onClick={() => setMode("select")}
-            title="选择"
-          >
-            <MousePointer2 size={25} />
-            <span>选择</span>
-          </button>
-          <span className="group-caption">选择</span>
-        </div>
-        <div className="ribbon-group create-group">
-          <div className="ribbon-tools">
-            {(
-              [
-                "line",
-                "rectangle",
-                "circle",
-                "arc",
-                "spline",
-                "polygon",
-              ] as Tool[]
-            ).map((mode) => {
-              const Icon = toolIcons[mode];
-              return (
-                <button
-                  key={mode}
-                  className={`ribbon-tool ${tool === mode ? "selected" : ""}`}
-                  title={toolLabels[mode]}
-                  aria-label={toolLabels[mode]}
-                  onClick={() => openToolConfig(mode)}
-                >
-                  <Icon size={25} />
-                  <span>
-                    {
-                      (
-                        {
-                          line: "直线",
-                          rectangle: "矩形",
-                          circle: "圆",
-                          arc: "圆弧",
-                          spline: "样条",
-                          polygon: "多边形",
-                        } as Record<string, string>
-                      )[mode]
-                    }
-                  </span>
-                </button>
-              );
-            })}
-          </div>
-          <button
-            className={`group-caption dropdown-caption ${menu === "create" ? "open" : ""}`}
-            onClick={() => menuToggle("create")}
-          >
-            创建
-            <ChevronDown size={12} />
-          </button>
-          {menu === "create" && (
-            <div className="menu ribbon-menu create-menu">
-              {(Object.keys(toolLabels) as Tool[])
-                .filter((m) => m !== "select")
-                .map((m) => (
-                  <MenuItem
-                    key={m}
-                    icon={toolIcons[m]}
-                    label={toolLabels[m]}
-                    shortcut={m === "line" ? "L" : undefined}
-                    onClick={() => openToolConfig(m)}
-                  />
-                ))}
-              <div className="menu-divider" />
-              {["mirror", "rectangularArray", "circularArray"].map((op) => (
-                <MenuItem
-                  key={op}
-                  icon={operationIcons[op]}
-                  label={operationNames[op]}
-                  onClick={() => startOperation(op)}
-                />
-              ))}
-            </div>
-          )}
-        </div>
-        <div className="ribbon-group modify-group">
-          <div className="ribbon-tools">
-            {["fillet", "trim", "offset", "move"].map((op) => {
-              const Icon = operationIcons[op];
-              return (
-                <button
-                  key={op}
-                  className={`ribbon-tool ${command?.type === "operation" && command.name === op ? "selected" : ""}`}
-                  title={operationNames[op]}
-                  onClick={() => startOperation(op)}
-                >
-                  <Icon size={25} />
-                  <span>{operationNames[op]}</span>
-                </button>
-              );
-            })}
-          </div>
-          <button
-            className={`group-caption dropdown-caption ${menu === "modify" ? "open" : ""}`}
-            onClick={() => menuToggle("modify")}
-          >
-            修改
-            <ChevronDown size={12} />
-          </button>
-          {menu === "modify" && (
-            <div className="menu ribbon-menu">
-              {[
-                "fillet",
-                "chamfer",
-                "blend",
-                "offset",
-                "trim",
-                "extend",
-                "break",
-                "scale",
-                "move",
-                "rotate",
-                "copy",
-                "detach",
-              ].map((op) => (
-                <MenuItem
-                  key={op}
-                  icon={operationIcons[op]}
-                  label={operationNames[op]}
-                  onClick={() => startOperation(op)}
-                />
-              ))}
-              <div className="menu-divider" />
-              <MenuItem
-                icon={SlidersHorizontal}
-                label="更改参数"
-                onClick={openParameters}
-              />
-            </div>
-          )}
-        </div>
-        <div className="ribbon-group dimension-group">
-          <button
-            className={`ribbon-tool ${dimensionMode ? "selected" : ""}`}
-            title="草图尺寸 (D)"
-            aria-pressed={dimensionMode}
-            onClick={() => startDimension()}
-          >
-            <Ruler size={26} />
-            <span>尺寸</span>
-          </button>
-          <span className="group-caption">标注</span>
-        </div>
-        <div className="ribbon-group constraints-group">
-          <div className="constraint-ribbon">
-            {constraintKinds.slice(0, 10).map((kind) => (
-              <IconButton
-                key={kind}
-                icon={constraintIcons[kind]}
-                title={constraintLabels[kind]}
-                disabled={!ready}
-                onClick={() => startConstraint(kind)}
-              />
-            ))}
-          </div>
-          <button
-            className="group-caption dropdown-caption"
-            onClick={() => menuToggle("constraints")}
-          >
-            约束
-            <ChevronDown size={12} />
-          </button>
-          {menu === "constraints" && (
-            <div className="menu ribbon-menu">
-              {constraintKinds.map((kind) => (
-                <MenuItem
-                  key={kind}
-                  icon={constraintIcons[kind]}
-                  label={constraintLabels[kind]}
-                  disabled={!ready}
-                  onClick={() => {
-                    startConstraint(kind);
-                    setMenu(null);
-                  }}
-                />
-              ))}
-            </div>
-          )}
-        </div>
-        <div className="ribbon-end">
-          <button
-            className="construction-button"
-            title="构造几何"
-            aria-label="构造几何"
-            aria-pressed={config.construction}
-            onClick={() => {
-              if (selection.length)
-                transaction("构造几何", (_, s) => {
-                  for (const e of s.entities)
-                    if (selection.some((p) => p.entityId === e.id))
-                      e.construction = !e.construction;
-                });
-              else setConfig({ ...config, construction: !config.construction });
-            }}
-          >
-            <CircleDashed size={22} />
-            <span>构造</span>
-          </button>
-        </div>
-      </div>
-      <main className="work-area">
-        <aside className="browser-panel">
-          <div className="panel-heading">
-            <span>浏览器</span>
-            <IconButton
-              icon={Plus}
-              title="新建草图"
-              disabled={!ready}
-              onClick={createSketch}
+      <div className="app-body">
+        {fileManager && (
+          <aside className="project-panel">
+            <FileManager
+              mode={fileManager}
+              document={doc}
+              project={workspace.project}
+              activeFileId={workspace.activeFile?.id}
+              initialFolderId={workspace.activeFile?.parentId ?? ROOT_ID}
+              onOpen={openVirtualProject}
+              onCreateProject={createVirtualProject}
+              onSaved={saveVirtualProject}
+              onProjectChanged={workspace.updateProject}
+              onEntriesChanged={refreshVirtualFiles}
+              onLockChange={setFileManagerLocked}
+              onClose={() => setFileManager(null)}
             />
-          </div>
-          <div className="tree-document">
-            <ChevronDown size={13} />
-            <FileJson size={16} />
-            <strong>{doc.name || "未命名草图"}</strong>
-          </div>
-          <div className="document-settings">
-            <Settings2 size={14} />
-            <span>文档设置</span>
-          </div>
-          <div className="unit-setting">
-            <Ruler size={14} />
-            <span>单位</span>
-            <select
-              aria-label="单位"
-              value={doc.unit}
-              onChange={(e) => {
-                if (
-                  transaction("切换单位", (candidate) => {
-                    candidate.unit = e.target.value as "mm" | "in";
-                  })
-                )
-                  setMode("select");
-              }}
-            >
-              <option value="mm">毫米</option>
-              <option value="in">英寸</option>
-            </select>
-          </div>
-          <div className="tree-section">
-            <Crosshair size={14} />
-            <span>原点</span>
-            <span className="subtle">XY</span>
-          </div>
-          <div className="tree-section">
-            <Rows3 size={14} />
-            <span>草图</span>
-            <span className="count-badge">{doc.sketches.length}</span>
-          </div>
-          <div className="sketch-tree">
-            {doc.sketches.map((s) => (
+          </aside>
+        )}
+        <div className="app-main">
+          <nav className="project-tabs" role="tablist" aria-label="打开的项目">
+            {projectTabs.map((tab) => (
               <div
-                key={s.id}
-                className={`sketch-row ${s.id === activeId ? "current" : ""}`}
+                key={tab.id}
+                className={`project-tab ${activeTabId === tab.id ? "active" : ""}`}
               >
                 <button
-                  className="sketch-name"
-                  onClick={() => switchSketch(s.id)}
+                  type="button"
+                  role="tab"
+                  aria-selected={activeTabId === tab.id}
+                  className="project-tab-label"
+                  title={tab.name}
+                  onClick={() => void activateProjectTab(tab)}
                 >
-                  <ChevronRight size={12} />
-                  <Pencil size={14} />
-                  <span>{s.name}</span>
+                  {tab.name}
                 </button>
-                <IconButton
-                  icon={s.visible ? Eye : EyeOff}
-                  title={`${s.visible ? "隐藏" : "显示"}${s.name}`}
-                  onClick={() =>
-                    transaction("草图可见性", (candidate) => {
-                      candidate.sketches.find((sk) => sk.id === s.id)!.visible =
-                        !s.visible;
-                    })
-                  }
-                />
-              </div>
-            ))}
-          </div>
-          <div className="entity-list-heading">
-            <span>几何对象</span>
-            <span>{sketch.entities.length}</span>
-          </div>
-          <div className="entity-list">
-            {sketch.entities.map((e, i) => {
-              const Icon =
-                toolIcons[
-                  (e.kind === "line"
-                    ? "line"
-                    : e.kind === "circle"
-                      ? "circle"
-                      : e.kind === "arc"
-                        ? "arc"
-                        : e.kind === "ellipse"
-                          ? "ellipse"
-                          : e.kind === "spline"
-                            ? "spline"
-                            : e.kind === "bezier"
-                              ? "bezier"
-                              : e.kind === "conic"
-                                ? "conic"
-                                : e.kind === "point"
-                                  ? "point"
-                                  : "text") as Tool
-                ];
-              return (
                 <button
-                  key={e.id}
-                  className={`entity-row ${displayedSelection.some((s) => s.entityId === e.id) ? "selected" : ""}`}
-                  title={e.sourceId ? "关联副本" : e.name}
-                  onClick={(event) =>
-                    select(
-                      { entityId: e.id },
-                      event.ctrlKey || event.metaKey || event.shiftKey,
-                    )
-                  }
-                  onDoubleClick={() => {
-                    if (!command) editEntity(e);
+                  type="button"
+                  className="project-tab-close"
+                  aria-label={`关闭 ${tab.name}`}
+                  title={`关闭 ${tab.name}`}
+                  onClick={(event) => {
+                    event.stopPropagation();
+                    void closeProjectTab(tab);
                   }}
                 >
-                  <Icon size={14} />
-                  <span>{e.name}</span>
-                  {e.sourceId ? (
-                    <GitBranch size={12} />
-                  ) : e.construction ? (
-                    <CircleDashed size={12} />
-                  ) : (
-                    <small>{String(i + 1).padStart(2, "0")}</small>
-                  )}
+                  <X size={12} />
                 </button>
-              );
-            })}
-          </div>
-          <div className="browser-footer">
-            <span className="plane-dot" />
-            XY 平面<span>2D</span>
-          </div>
-        </aside>
-        <div className="canvas-container">
-          <Viewport
-            sketches={doc.sketches}
-            activeId={activeId}
-            selection={displayedSelection}
-            tool={tool}
-            drafts={drafts}
-            operationPreview={operationPreview.entities}
-            config={config}
-            grid={grid}
-            snap={snap}
-            snapOptions={snapOptions}
-            fitKey={fitKey}
-            unit={doc.unit}
-            onPlace={place}
-            onSelect={select}
-            onBox={(ids, additive) => {
-              if (command) {
-                changeCommandSelection(
-                  ids.map((entityId) => ({ entityId })),
-                  additive ? "append" : "replace",
-                );
-                return;
-              }
-              if (!additive) setSelectedDimensionId(null);
-              setSelection((prev) => {
-                const next = ids.map((entityId) => ({ entityId }));
-                return additive
-                  ? [...prev.filter((p) => !ids.includes(p.entityId)), ...next]
-                  : next;
-              });
-            }}
-            onCursor={setCursor}
-            onDrag={drag}
-            onFinish={(point, snapRef) => {
-              if (tool === "spline") finishSpline(point, snapRef);
-              else {
-                setDrafts([]);
-                draftSnaps.current = [];
-                draftCaptured.current = false;
-              }
-            }}
-            onEditConstraint={(id) => {
-              const c = sketch.constraints.find((c) => c.id === id);
-              if (c) openDimensionInput(c.kind, c.refs, { existingId: c.id });
-            }}
-            pickParameters={
-              command
-                ? command.geometry[command.active]?.kind === "position"
-                  ? "position"
-                  : "geometry"
-                : undefined
-            }
-            onParameterPick={pickCommand}
-            pickDimension={dimensionMode}
-            dimensionPicks={dimensionPicks}
-            dimensionKindMode={dimensionKindMode}
-            dimensionGuides={
-              dimensionMode && !dimensionDraft
-                ? (dimensionPicks
-                    .filter((ref) => resolveEntity(sketch, ref)?.id !== ref)
-                    .map((ref) => referencePoint(sketch, ref))
-                    .filter(Boolean) as XY[])
-                : []
-            }
-            dimensionDraft={dimensionDraft}
-            dimensionAdjustment={dimensionAdjustment}
-            onDimensionAdjust={adjustDimension}
-            onDimensionPositionCommit={commitDimensionPosition}
-            dimensionSelection={selectedDimensionId}
-            onDimensionSelect={selectDimension}
-            onDimensionPick={pickDimension}
-            onDimensionCommit={commitDimension}
-            onDimensionCancel={cancelDimensions}
-          />
-          {command && (
-            <ParameterPanel
-              session={command}
-              sketch={sketch}
-              unit={unit}
-              factor={factor}
-              error={commandError}
-              onChange={setCommand}
-              onConfirm={confirmCommand}
-              onCancel={cancel}
-            />
-          )}
-          {!ready && (
-            <div className="loading-overlay">
-              <LoaderCircle size={23} className="spin" />
-              <span>加载几何求解器</span>
-            </div>
-          )}
-        </div>
-        <aside className="properties-panel">
-          <div className="panel-heading">
-            <span>草图选项</span>
-            <Settings2 size={16} />
-          </div>
-          <div className="option-list">
-            <label>
-              <span>
-                <Grid3X3 size={15} />
-                网格
-              </span>
-              <input
-                type="checkbox"
-                checked={grid}
-                onChange={(e) => setGrid(e.target.checked)}
-              />
-            </label>
-            <label>
-              <span>
-                <Magnet size={15} />
-                吸附
-              </span>
-              <input
-                type="checkbox"
-                checked={snap}
-                onChange={(e) => setSnap(e.target.checked)}
-              />
-            </label>
-            <label>
-              <span>
-                <GitMerge size={15} />
-                自动约束
-              </span>
-              <input
-                type="checkbox"
-                checked={config.autoConstraint}
-                onChange={(e) =>
-                  setConfig({ ...config, autoConstraint: e.target.checked })
-                }
-              />
-            </label>
-            <label>
-              <span>
-                <CircleDashed size={15} />
-                构造几何
-              </span>
-              <input
-                type="checkbox"
-                checked={config.construction}
-                onChange={(e) =>
-                  setConfig({ ...config, construction: e.target.checked })
-                }
-              />
-            </label>
-          </div>
-          <div className="section-heading">
-            <span>属性</span>
-            {one && (
-              <IconButton
-                icon={Pencil}
-                title="编辑对象属性"
-                onClick={() => editEntity(one)}
-              />
-            )}
-          </div>
-          <div className="property-content">
-            {selection.length ? (
-              <>
-                <div className="property-title">
-                  {selection.length === 1
-                    ? selection[0].pointId
-                      ? "控制点"
-                      : one?.name
-                    : `${selectedEntities.length} 个对象`}
-                  <span className="property-chip">
-                    {selection[0]?.pointId
-                      ? "点"
-                      : one
-                        ? kindLabels[one.kind]
-                        : "多选"}
-                  </span>
-                </div>
-                {one && (
-                  <>
-                    <div className="property-row">
-                      <span>X</span>
-                      <strong>
-                        {formatted(one.points[0].x)}
-                        <small>{unit}</small>
-                      </strong>
-                    </div>
-                    <div className="property-row">
-                      <span>Y</span>
-                      <strong>
-                        {formatted(one.points[0].y)}
-                        <small>{unit}</small>
-                      </strong>
-                    </div>
-                    {one.kind === "line" && (
-                      <div className="property-row">
-                        <span>长度</span>
-                        <strong>
-                          {formatted(dist(one.points[0], one.points[1]))}
-                          <small>{unit}</small>
-                        </strong>
-                      </div>
-                    )}
-                    {(one.kind === "circle" || one.kind === "arc") && (
-                      <div className="property-row">
-                        <span>{one.kind === "circle" ? "直径" : "半径"}</span>
-                        <strong>
-                          {formatted(
-                            one.kind === "arc"
-                              ? arcInfo(one).r
-                              : 2 * (one.radius ?? 0),
-                          )}
-                          <small>{unit}</small>
-                        </strong>
-                      </div>
-                    )}
-                    {one.sourceId && (
-                      <div className="derived-note">
-                        <GitBranch size={14} />
-                        关联几何
-                        <IconButton
-                          icon={Unlink}
-                          title="解除关联"
-                          onClick={() => startOperation("detach")}
-                        />
-                      </div>
-                    )}
-                  </>
-                )}
-                <div className="selection-actions">
-                  <button
-                    className="button small"
-                    onClick={() => startDimension()}
-                  >
-                    <Ruler size={14} />
-                    尺寸
-                  </button>
-                  <IconButton
-                    icon={Trash2}
-                    title="删除选中对象"
-                    onClick={removeSelected}
-                  />
-                </div>
-              </>
-            ) : selectedDimension ? (
-              <div data-testid="selected-dimension">
-                <div className="property-title">
-                  标注
-                  <span className="property-chip">
-                    {constraintLabels[selectedDimension.kind]}
-                  </span>
-                </div>
-                {selectedDimension.value !== undefined && (
-                  <div className="property-row">
-                    <span>数值</span>
-                    <strong>
-                      {selectedDimension.expression ??
-                        (selectedDimension.kind === "angle"
-                          ? `${Number(selectedDimension.value.toFixed(2))}°`
-                          : formatted(selectedDimension.value))}
-                    </strong>
-                  </div>
-                )}
-                <div className="selection-actions">
-                  {selectedDimension.value !== undefined && (
-                    <button
-                      className="button small"
-                      onClick={() =>
-                        openDimensionInput(
-                          selectedDimension.kind,
-                          selectedDimension.refs,
-                          { existingId: selectedDimension.id },
-                        )
-                      }
-                    >
-                      <Ruler size={14} />
-                      编辑
-                    </button>
-                  )}
-                  <IconButton
-                    icon={Trash2}
-                    title="删除选中对象"
-                    onClick={removeSelected}
-                  />
-                </div>
               </div>
-            ) : (
-              <div className="empty-selection">
-                <MousePointer2 size={21} />
-                <span>未选择对象</span>
-              </div>
-            )}
-          </div>
-          <div className="section-heading">
-            <span>几何约束</span>
-            <span className="count-badge">{sketch.constraints.length}</span>
-          </div>
-          <div className="constraint-grid">
-            {constraintKinds.map((kind) => (
-              <IconButton
-                key={kind}
-                icon={constraintIcons[kind]}
-                title={constraintLabels[kind]}
-                disabled={!ready}
-                onClick={() => startConstraint(kind)}
-              />
             ))}
-          </div>
-          <div className="dimension-select">
-            <select
-              aria-label="尺寸类型"
-              value={dimensionKindMode}
-              onChange={(e) => {
-                const mode = e.target.value as DimensionPickMode;
-                setDimensionKindMode(mode);
-                setDimensionPicks([]);
-                setDimensionDraft(null);
-                startDimension(mode);
-              }}
+            <button
+              type="button"
+              className="project-tab-add"
+              aria-label="新建未命名项目"
+              title="新建未命名项目"
+              disabled={!workspace.ready || projectTransition !== null}
+              onClick={() => void addUntitledProject()}
             >
-              <option value="auto">自动</option>
-              {(
-                [
-                  "length",
-                  "lineDistance",
-                  "distanceX",
-                  "distanceY",
-                  "radius",
-                  "diameter",
-                  "angle",
-                ] as ConstraintKind[]
-              ).map((kind) => (
-                <option key={kind} value={kind}>
-                  {constraintLabels[kind]}
-                </option>
-              ))}
-            </select>
+              <Plus size={14} />
+            </button>
+          </nav>
+          <nav className="workspace-tabbar" aria-label="一级标签">
+            <div className="file-menu-wrap">
+              <button
+                className="file-menu-toggle"
+                onClick={() => menuToggle("file")}
+              >
+                <FileJson size={15} />
+                文件
+                <ChevronDown size={12} />
+              </button>
+              {menu === "file" && (
+                <div className="menu file-menu">
+                  <MenuItem
+                    icon={FolderOpen}
+                    label="项目管理"
+                    shortcut="Ctrl O"
+                    onClick={() => openFileManager("browse")}
+                  />
+                  <div className="menu-divider" />
+                  <MenuItem
+                    icon={FilePlus2}
+                    label="新建文档"
+                    onClick={() => newDocument()}
+                  />
+                  <MenuItem
+                    icon={FolderOpen}
+                    label="打开草图"
+                    onClick={() => {
+                      fileInput.current?.click();
+                      setMenu(null);
+                    }}
+                  />
+                  <MenuItem
+                    icon={Save}
+                    label="保存草图"
+                    shortcut="Ctrl S"
+                    onClick={() => void saveProject()}
+                  />
+                  <MenuItem
+                    icon={Save}
+                    label="项目另存为"
+                    shortcut="Ctrl Shift S"
+                    onClick={() => openFileManager("save")}
+                  />
+                  <MenuItem
+                    icon={Download}
+                    label="下载项目"
+                    onClick={downloadProject}
+                  />
+                  <MenuItem
+                    icon={FileJson}
+                    label="导出 JSON 草图"
+                    onClick={saveJson}
+                  />
+                  <div className="menu-divider" />
+                  <MenuItem
+                    icon={Hexagon}
+                    label="打开连接板示例"
+                    onClick={() => newDocument(true)}
+                  />
+                  <MenuItem
+                    icon={Download}
+                    label="导出 DXF / SVG / PDF"
+                    onClick={openExport}
+                  />
+                </div>
+              )}
+            </div>
             <IconButton
-              icon={Ruler}
-              title="添加尺寸"
-              active={dimensionMode}
-              onClick={() => startDimension()}
+              icon={Save}
+              title="保存当前项目"
+              disabled={!workspace.ready || fileManagerLocked}
+              onClick={() => openFileManager("save")}
             />
-          </div>
-          <div className="constraint-list">
-            {sketch.constraints
-              .filter(
-                (c) =>
-                  !selection.length ||
-                  c.refs.some((r) =>
-                    selection.some(
-                      (s) =>
-                        s.entityId === r ||
-                        s.pointId === r ||
-                        sketch.entities
-                          .find((e) => e.id === s.entityId)
-                          ?.points.some((p) => p.id === r),
-                    ),
-                  ),
-              )
-              .map((c) => {
-                const Icon = constraintIcons[c.kind];
-                return (
-                  <div
-                    key={c.id}
-                    className={`constraint-row ${solverState.conflicting.includes(c.id) ? "conflict" : ""}`}
-                  >
-                    <Icon size={13} />
+            <IconButton
+              icon={Undo2}
+              title="撤销 (Ctrl+Z)"
+              disabled={!history.current.length}
+              onClick={undo}
+            />
+            <IconButton
+              icon={Redo2}
+              title="重做 (Ctrl+Shift+Z)"
+              disabled={!future.current.length}
+              onClick={redo}
+            />
+            <div className="tab-divider" />
+            <button className="workspace-tab selected">草图</button>
+            <div className="tab-spacer" />
+            <IconButton
+              icon={PanelLeftClose}
+              title="切换左侧栏"
+              active={!leftOpen}
+              disabled={fileManagerLocked}
+              onClick={() => setLeftOpen(!leftOpen)}
+            />
+            <IconButton
+              icon={PanelRightClose}
+              title="切换属性面板"
+              active={!rightOpen}
+              disabled={tool !== "select"}
+              onClick={() => setRightOpen(!rightOpen)}
+            />
+          </nav>
+          <div className="ribbon">
+            <div className="ribbon-group select-group">
+              <button
+                className={`ribbon-tool ${tool === "select" && !command ? "selected" : ""}`}
+                onClick={() => setMode("select")}
+                title="选择"
+              >
+                <MousePointer2 size={25} />
+                <span>选择</span>
+              </button>
+              <span className="group-caption">选择</span>
+            </div>
+            <div className="ribbon-group create-group">
+              <div className="ribbon-tools">
+                {(
+                  [
+                    "line",
+                    "rectangle",
+                    "circle",
+                    "arc",
+                    "spline",
+                    "polygon",
+                  ] as Tool[]
+                ).map((mode) => {
+                  const Icon = toolIcons[mode];
+                  return (
                     <button
-                      title="定位约束"
-                      onClick={() =>
-                        setSelection(
-                          c.refs
-                            .map((r) => {
-                              const e = resolveEntity(sketch, r);
-                              return e
-                                ? {
-                                    entityId: e.id,
-                                    pointId: e.id === r ? undefined : r,
-                                  }
-                                : undefined;
-                            })
-                            .filter(Boolean) as Selection[],
-                        )
-                      }
+                      key={mode}
+                      className={`ribbon-tool ${creationMethods(tool).some((method) => method.tool === mode) ? "selected" : ""}`}
+                      title={toolLabels[mode]}
+                      aria-label={toolLabels[mode]}
+                      onClick={() => setMode(mode)}
                     >
-                      {constraintLabels[c.kind]}
+                      <Icon size={25} />
+                      <span>
+                        {
+                          (
+                            {
+                              line: "直线",
+                              rectangle: "矩形",
+                              circle: "圆",
+                              arc: "圆弧",
+                              spline: "样条",
+                              polygon: "多边形",
+                            } as Record<string, string>
+                          )[mode]
+                        }
+                      </span>
                     </button>
-                    {c.value !== undefined && (
+                  );
+                })}
+              </div>
+              <button
+                className={`group-caption dropdown-caption ${menu === "create" ? "open" : ""}`}
+                onClick={() => menuToggle("create")}
+              >
+                创建
+                <ChevronDown size={12} />
+              </button>
+              {menu === "create" && (
+                <div className="menu ribbon-menu create-menu">
+                  {(Object.keys(toolLabels) as Tool[])
+                    .filter((m) => m !== "select")
+                    .map((m) => (
+                      <MenuItem
+                        key={m}
+                        icon={toolIcons[m]}
+                        label={toolLabels[m]}
+                        shortcut={m === "line" ? "L" : undefined}
+                        onClick={() => setMode(m)}
+                      />
+                    ))}
+                  <div className="menu-divider" />
+                  {["mirror", "rectangularArray", "circularArray"].map((op) => (
+                    <MenuItem
+                      key={op}
+                      icon={operationIcons[op]}
+                      label={operationNames[op]}
+                      onClick={() => startOperation(op)}
+                    />
+                  ))}
+                </div>
+              )}
+            </div>
+            <div className="ribbon-group modify-group">
+              <div className="ribbon-tools">
+                {["fillet", "trim", "offset", "move"].map((op) => {
+                  const Icon = operationIcons[op];
+                  return (
+                    <button
+                      key={op}
+                      className={`ribbon-tool ${command?.type === "operation" && command.name === op ? "selected" : ""}`}
+                      title={operationNames[op]}
+                      onClick={() => startOperation(op)}
+                    >
+                      <Icon size={25} />
+                      <span>{operationNames[op]}</span>
+                    </button>
+                  );
+                })}
+              </div>
+              <button
+                className={`group-caption dropdown-caption ${menu === "modify" ? "open" : ""}`}
+                onClick={() => menuToggle("modify")}
+              >
+                修改
+                <ChevronDown size={12} />
+              </button>
+              {menu === "modify" && (
+                <div className="menu ribbon-menu">
+                  {[
+                    "fillet",
+                    "chamfer",
+                    "blend",
+                    "offset",
+                    "trim",
+                    "extend",
+                    "break",
+                    "scale",
+                    "move",
+                    "rotate",
+                    "copy",
+                    "detach",
+                  ].map((op) => (
+                    <MenuItem
+                      key={op}
+                      icon={operationIcons[op]}
+                      label={operationNames[op]}
+                      onClick={() => startOperation(op)}
+                    />
+                  ))}
+                  <div className="menu-divider" />
+                  <MenuItem
+                    icon={SlidersHorizontal}
+                    label="更改参数"
+                    onClick={openParameters}
+                  />
+                </div>
+              )}
+            </div>
+            <div className="ribbon-group dimension-group">
+              <button
+                className={`ribbon-tool ${dimensionMode ? "selected" : ""}`}
+                title="草图尺寸 (D)"
+                aria-pressed={dimensionMode}
+                onClick={() => startDimension()}
+              >
+                <Ruler size={26} />
+                <span>尺寸</span>
+              </button>
+              <span className="group-caption">标注</span>
+            </div>
+            <div className="ribbon-group constraints-group">
+              <div className="constraint-ribbon">
+                {constraintKinds.slice(0, 10).map((kind) => (
+                  <IconButton
+                    key={kind}
+                    icon={constraintIcons[kind]}
+                    title={constraintLabels[kind]}
+                    disabled={!ready}
+                    onClick={() => startConstraint(kind)}
+                  />
+                ))}
+              </div>
+              <button
+                className="group-caption dropdown-caption"
+                onClick={() => menuToggle("constraints")}
+              >
+                约束
+                <ChevronDown size={12} />
+              </button>
+              {menu === "constraints" && (
+                <div className="menu ribbon-menu">
+                  {constraintKinds.map((kind) => (
+                    <MenuItem
+                      key={kind}
+                      icon={constraintIcons[kind]}
+                      label={constraintLabels[kind]}
+                      disabled={!ready}
+                      onClick={() => {
+                        startConstraint(kind);
+                        setMenu(null);
+                      }}
+                    />
+                  ))}
+                </div>
+              )}
+            </div>
+            <div className="ribbon-end">
+              <button
+                className="construction-button"
+                title="构造几何"
+                aria-label="构造几何"
+                aria-pressed={config.construction}
+                onClick={() => {
+                  if (selection.length)
+                    transaction("构造几何", (_, s) => {
+                      for (const e of s.entities)
+                        if (selection.some((p) => p.entityId === e.id))
+                          e.construction = !e.construction;
+                    });
+                  else
+                    setConfig({
+                      ...config,
+                      construction: !config.construction,
+                    });
+                }}
+              >
+                <CircleDashed size={22} />
+                <span>构造</span>
+              </button>
+            </div>
+          </div>
+          <main className="work-area">
+            <aside className="browser-panel">
+              <div className="sketch-browser">
+                <div className="panel-heading">
+                  <span>浏览器</span>
+                  <IconButton
+                    icon={Plus}
+                    title="新建草图"
+                    disabled={!ready}
+                    onClick={createSketch}
+                  />
+                </div>
+                <div className="tree-document">
+                  <ChevronDown size={13} />
+                  <FileJson size={16} />
+                  <strong>{doc.name || "未命名草图"}</strong>
+                </div>
+                <div className="document-settings">
+                  <Settings2 size={14} />
+                  <span>文档设置</span>
+                </div>
+                <div className="unit-setting">
+                  <Ruler size={14} />
+                  <span>单位</span>
+                  <select
+                    aria-label="单位"
+                    value={doc.unit}
+                    onChange={(e) => {
+                      if (
+                        transaction("切换单位", (candidate) => {
+                          candidate.unit = e.target.value as "mm" | "in";
+                        })
+                      )
+                        setMode("select");
+                    }}
+                  >
+                    <option value="mm">毫米</option>
+                    <option value="in">英寸</option>
+                  </select>
+                </div>
+                <div className="tree-section">
+                  <Crosshair size={14} />
+                  <span>原点</span>
+                  <span className="subtle">XY</span>
+                </div>
+                <div className="tree-section">
+                  <Rows3 size={14} />
+                  <span>草图</span>
+                  <span className="count-badge">{doc.sketches.length}</span>
+                </div>
+                <div className="sketch-tree">
+                  {doc.sketches.map((s) => (
+                    <div
+                      key={s.id}
+                      className={`sketch-row ${s.id === activeId ? "current" : ""}`}
+                    >
                       <button
-                        className="constraint-value"
-                        title="编辑尺寸"
+                        className="sketch-name"
+                        onClick={() => switchSketch(s.id)}
+                      >
+                        <ChevronRight size={12} />
+                        <Pencil size={14} />
+                        <span>{s.name}</span>
+                      </button>
+                      <IconButton
+                        icon={s.visible ? Eye : EyeOff}
+                        title={`${s.visible ? "隐藏" : "显示"}${s.name}`}
                         onClick={() =>
-                          openDimensionInput(c.kind, c.refs, {
-                            existingId: c.id,
+                          transaction("草图可见性", (candidate) => {
+                            candidate.sketches.find(
+                              (sk) => sk.id === s.id,
+                            )!.visible = !s.visible;
                           })
                         }
+                      />
+                    </div>
+                  ))}
+                </div>
+                <div className="entity-list-heading">
+                  <span>几何对象</span>
+                  <span>{sketch.entities.length}</span>
+                </div>
+                <div className="entity-list">
+                  {sketch.entities.map((e, i) => {
+                    const Icon =
+                      toolIcons[
+                        (e.kind === "line"
+                          ? "line"
+                          : e.kind === "circle"
+                            ? "circle"
+                            : e.kind === "arc"
+                              ? "arc"
+                              : e.kind === "ellipse"
+                                ? "ellipse"
+                                : e.kind === "spline"
+                                  ? "spline"
+                                  : e.kind === "bezier"
+                                    ? "bezier"
+                                    : e.kind === "conic"
+                                      ? "conic"
+                                      : e.kind === "point"
+                                        ? "point"
+                                        : "text") as Tool
+                      ];
+                    return (
+                      <button
+                        key={e.id}
+                        className={`entity-row ${displayedSelection.some((s) => s.entityId === e.id) ? "selected" : ""}`}
+                        title={e.sourceId ? "关联副本" : e.name}
+                        onClick={(event) =>
+                          select(
+                            { entityId: e.id },
+                            event.ctrlKey || event.metaKey || event.shiftKey,
+                          )
+                        }
+                        onDoubleClick={() => {
+                          if (!command) editEntity(e);
+                        }}
                       >
-                        {c.expression ??
-                          (c.kind === "angle"
-                            ? `${Number(c.value.toFixed(2))}°`
-                            : formatted(c.value))}
+                        <Icon size={14} />
+                        <span>{e.name}</span>
+                        {e.sourceId ? (
+                          <GitBranch size={12} />
+                        ) : e.construction ? (
+                          <CircleDashed size={12} />
+                        ) : (
+                          <small>{String(i + 1).padStart(2, "0")}</small>
+                        )}
                       </button>
+                    );
+                  })}
+                </div>
+                <div className="browser-footer">
+                  <span className="plane-dot" />
+                  XY 平面<span>2D</span>
+                </div>
+              </div>
+            </aside>
+            <div className="canvas-container">
+              <Viewport
+                sketches={doc.sketches}
+                activeId={activeId}
+                selection={displayedSelection}
+                tool={tool}
+                drafts={drafts}
+                creationActive={creationActive}
+                operationPreview={operationPreview.entities}
+                config={config}
+                grid={grid}
+                snap={snap}
+                snapOptions={snapOptions}
+                fitKey={fitKey}
+                unit={doc.unit}
+                onPlace={place}
+                onSelect={select}
+                onBox={(ids, additive) => {
+                  if (command) {
+                    changeCommandSelection(
+                      ids.map((entityId) => ({ entityId })),
+                      additive ? "append" : "replace",
+                    );
+                    return;
+                  }
+                  if (!additive) setSelectedDimensionId(null);
+                  setSelection((prev) => {
+                    const next = ids.map((entityId) => ({ entityId }));
+                    return additive
+                      ? [
+                          ...prev.filter((p) => !ids.includes(p.entityId)),
+                          ...next,
+                        ]
+                      : next;
+                  });
+                }}
+                onCursor={setCursor}
+                onDrag={drag}
+                onFinish={(point, snapRef) => {
+                  if (tool === "spline") finishSpline(point, snapRef);
+                  else {
+                    setDrafts([]);
+                    setCreationActive(0);
+                    setCreationPickRevision((version) => version + 1);
+                    draftSnaps.current = [];
+                    draftCaptured.current = false;
+                  }
+                }}
+                onEditConstraint={(id) => {
+                  const c = sketch.constraints.find((c) => c.id === id);
+                  if (c)
+                    openDimensionInput(c.kind, c.refs, { existingId: c.id });
+                }}
+                pickParameters={
+                  command
+                    ? command.geometry[command.active]?.kind === "position"
+                      ? "position"
+                      : "geometry"
+                    : undefined
+                }
+                onParameterPick={pickCommand}
+                pickDimension={dimensionMode}
+                dimensionPicks={dimensionPicks}
+                dimensionKindMode={dimensionKindMode}
+                dimensionGuides={
+                  dimensionMode && !dimensionDraft
+                    ? (dimensionPicks
+                        .filter((ref) => resolveEntity(sketch, ref)?.id !== ref)
+                        .map((ref) => referencePoint(sketch, ref))
+                        .filter(Boolean) as XY[])
+                    : []
+                }
+                dimensionDraft={dimensionDraft}
+                dimensionAdjustment={dimensionAdjustment}
+                onDimensionAdjust={adjustDimension}
+                onDimensionPositionCommit={commitDimensionPosition}
+                dimensionSelection={selectedDimensionId}
+                onDimensionSelect={selectDimension}
+                onDimensionPick={pickDimension}
+                onDimensionCommit={commitDimension}
+                onDimensionCancel={cancelDimensions}
+              />
+              {command && (
+                <ParameterPanel
+                  session={command}
+                  sketch={sketch}
+                  unit={unit}
+                  factor={factor}
+                  error={commandError}
+                  onChange={setCommand}
+                  onConfirm={confirmCommand}
+                  onCancel={cancel}
+                />
+              )}
+              {!ready && (
+                <div className="loading-overlay">
+                  <LoaderCircle size={23} className="spin" />
+                  <span>加载几何求解器</span>
+                </div>
+              )}
+            </div>
+            <aside
+              className="properties-panel"
+              aria-label={tool !== "select" ? "绘制参数" : "属性与约束"}
+            >
+              <div className="panel-heading">
+                <span>草图选项</span>
+                <Settings2 size={16} />
+              </div>
+              <div className="option-list">
+                <label>
+                  <span>
+                    <Grid3X3 size={15} />
+                    网格
+                  </span>
+                  <input
+                    type="checkbox"
+                    checked={grid}
+                    onChange={(e) => setGrid(e.target.checked)}
+                  />
+                </label>
+                <label>
+                  <span>
+                    <Magnet size={15} />
+                    吸附
+                  </span>
+                  <input
+                    type="checkbox"
+                    checked={snap}
+                    onChange={(e) => setSnap(e.target.checked)}
+                  />
+                </label>
+                <label>
+                  <span>
+                    <GitMerge size={15} />
+                    自动约束
+                  </span>
+                  <input
+                    type="checkbox"
+                    checked={config.autoConstraint}
+                    onChange={(e) =>
+                      setConfig({ ...config, autoConstraint: e.target.checked })
+                    }
+                  />
+                </label>
+                <label>
+                  <span>
+                    <CircleDashed size={15} />
+                    构造几何
+                  </span>
+                  <input
+                    type="checkbox"
+                    checked={config.construction}
+                    onChange={(e) =>
+                      setConfig({ ...config, construction: e.target.checked })
+                    }
+                  />
+                </label>
+              </div>
+              {tool !== "select" && !command ? (
+                <CreationPanel
+                  tool={tool}
+                  points={drafts}
+                  active={creationActive}
+                  pickRevision={creationPickRevision}
+                  config={config}
+                  unit={unit}
+                  factor={factor}
+                  error={creationError}
+                  onToolChange={setMode}
+                  onActivate={(index) => {
+                    if (index <= drafts.length) setCreationActive(index);
+                  }}
+                  onPointChange={changeCreationPoint}
+                  onTruncate={truncateCreation}
+                  onConfigChange={setConfig}
+                  onInputValidityChange={setCreationInputsValid}
+                  onComplete={() => {
+                    if (tool === "spline") finishSpline();
+                    else completeCreation();
+                  }}
+                  onCancel={cancel}
+                />
+              ) : (
+                <>
+                  <div className="section-heading">
+                    <span>属性</span>
+                    {one && (
+                      <IconButton
+                        icon={Pencil}
+                        title="编辑对象属性"
+                        onClick={() => editEntity(one)}
+                      />
                     )}
+                  </div>
+                  <div className="property-content">
+                    {selection.length ? (
+                      <>
+                        <div className="property-title">
+                          {selection.length === 1
+                            ? selection[0].pointId
+                              ? "控制点"
+                              : one?.name
+                            : `${selectedEntities.length} 个对象`}
+                          <span className="property-chip">
+                            {selection[0]?.pointId
+                              ? "点"
+                              : one
+                                ? kindLabels[one.kind]
+                                : "多选"}
+                          </span>
+                        </div>
+                        {one && (
+                          <>
+                            <div className="property-row">
+                              <span>X</span>
+                              <strong>
+                                {formatted(one.points[0].x)}
+                                <small>{unit}</small>
+                              </strong>
+                            </div>
+                            <div className="property-row">
+                              <span>Y</span>
+                              <strong>
+                                {formatted(one.points[0].y)}
+                                <small>{unit}</small>
+                              </strong>
+                            </div>
+                            {one.kind === "line" && (
+                              <div className="property-row">
+                                <span>长度</span>
+                                <strong>
+                                  {formatted(
+                                    dist(one.points[0], one.points[1]),
+                                  )}
+                                  <small>{unit}</small>
+                                </strong>
+                              </div>
+                            )}
+                            {(one.kind === "circle" || one.kind === "arc") && (
+                              <div className="property-row">
+                                <span>
+                                  {one.kind === "circle" ? "直径" : "半径"}
+                                </span>
+                                <strong>
+                                  {formatted(
+                                    one.kind === "arc"
+                                      ? arcInfo(one).r
+                                      : 2 * (one.radius ?? 0),
+                                  )}
+                                  <small>{unit}</small>
+                                </strong>
+                              </div>
+                            )}
+                            {one.sourceId && (
+                              <div className="derived-note">
+                                <GitBranch size={14} />
+                                关联几何
+                                <IconButton
+                                  icon={Unlink}
+                                  title="解除关联"
+                                  onClick={() => startOperation("detach")}
+                                />
+                              </div>
+                            )}
+                          </>
+                        )}
+                        <div className="selection-actions">
+                          <button
+                            className="button small"
+                            onClick={() => startDimension()}
+                          >
+                            <Ruler size={14} />
+                            尺寸
+                          </button>
+                          <IconButton
+                            icon={Trash2}
+                            title="删除选中对象"
+                            onClick={removeSelected}
+                          />
+                        </div>
+                      </>
+                    ) : selectedDimension ? (
+                      <div data-testid="selected-dimension">
+                        <div className="property-title">
+                          标注
+                          <span className="property-chip">
+                            {constraintLabels[selectedDimension.kind]}
+                          </span>
+                        </div>
+                        {selectedDimension.value !== undefined && (
+                          <div className="property-row">
+                            <span>数值</span>
+                            <strong>
+                              {selectedDimension.expression ??
+                                (selectedDimension.kind === "angle"
+                                  ? `${Number(selectedDimension.value.toFixed(2))}°`
+                                  : formatted(selectedDimension.value))}
+                            </strong>
+                          </div>
+                        )}
+                        <div className="selection-actions">
+                          {selectedDimension.value !== undefined && (
+                            <button
+                              className="button small"
+                              onClick={() =>
+                                openDimensionInput(
+                                  selectedDimension.kind,
+                                  selectedDimension.refs,
+                                  { existingId: selectedDimension.id },
+                                )
+                              }
+                            >
+                              <Ruler size={14} />
+                              编辑
+                            </button>
+                          )}
+                          <IconButton
+                            icon={Trash2}
+                            title="删除选中对象"
+                            onClick={removeSelected}
+                          />
+                        </div>
+                      </div>
+                    ) : (
+                      <div className="empty-selection">
+                        <MousePointer2 size={21} />
+                        <span>未选择对象</span>
+                      </div>
+                    )}
+                  </div>
+                  <div className="section-heading">
+                    <span>几何约束</span>
+                    <span className="count-badge">
+                      {sketch.constraints.length}
+                    </span>
+                  </div>
+                  <div className="constraint-grid">
+                    {constraintKinds.map((kind) => (
+                      <IconButton
+                        key={kind}
+                        icon={constraintIcons[kind]}
+                        title={constraintLabels[kind]}
+                        disabled={!ready}
+                        onClick={() => startConstraint(kind)}
+                      />
+                    ))}
+                  </div>
+                  <div className="dimension-select">
+                    <select
+                      aria-label="尺寸类型"
+                      value={dimensionKindMode}
+                      onChange={(e) => {
+                        const mode = e.target.value as DimensionPickMode;
+                        setDimensionKindMode(mode);
+                        setDimensionPicks([]);
+                        setDimensionDraft(null);
+                        startDimension(mode);
+                      }}
+                    >
+                      <option value="auto">自动</option>
+                      {(
+                        [
+                          "length",
+                          "lineDistance",
+                          "distanceX",
+                          "distanceY",
+                          "radius",
+                          "diameter",
+                          "angle",
+                        ] as ConstraintKind[]
+                      ).map((kind) => (
+                        <option key={kind} value={kind}>
+                          {constraintLabels[kind]}
+                        </option>
+                      ))}
+                    </select>
                     <IconButton
-                      icon={X}
-                      title={`移除${constraintLabels[c.kind]}约束`}
-                      onClick={() =>
-                        transaction("移除约束", (_, s) => {
-                          s.constraints = s.constraints.filter(
-                            (item) => item.id !== c.id,
-                          );
-                        })
-                      }
+                      icon={Ruler}
+                      title="添加尺寸"
+                      active={dimensionMode}
+                      onClick={() => startDimension()}
                     />
                   </div>
-                );
-              })}
+                  <div className="constraint-list">
+                    {sketch.constraints
+                      .filter(
+                        (c) =>
+                          !selection.length ||
+                          c.refs.some((r) =>
+                            selection.some(
+                              (s) =>
+                                s.entityId === r ||
+                                s.pointId === r ||
+                                sketch.entities
+                                  .find((e) => e.id === s.entityId)
+                                  ?.points.some((p) => p.id === r),
+                            ),
+                          ),
+                      )
+                      .map((c) => {
+                        const Icon = constraintIcons[c.kind];
+                        return (
+                          <div
+                            key={c.id}
+                            className={`constraint-row ${solverState.conflicting.includes(c.id) ? "conflict" : ""}`}
+                          >
+                            <Icon size={13} />
+                            <button
+                              title="定位约束"
+                              onClick={() =>
+                                setSelection(
+                                  c.refs
+                                    .map((r) => {
+                                      const e = resolveEntity(sketch, r);
+                                      return e
+                                        ? {
+                                            entityId: e.id,
+                                            pointId: e.id === r ? undefined : r,
+                                          }
+                                        : undefined;
+                                    })
+                                    .filter(Boolean) as Selection[],
+                                )
+                              }
+                            >
+                              {constraintLabels[c.kind]}
+                            </button>
+                            {c.value !== undefined && (
+                              <button
+                                className="constraint-value"
+                                title="编辑尺寸"
+                                onClick={() =>
+                                  openDimensionInput(c.kind, c.refs, {
+                                    existingId: c.id,
+                                  })
+                                }
+                              >
+                                {c.expression ??
+                                  (c.kind === "angle"
+                                    ? `${Number(c.value.toFixed(2))}°`
+                                    : formatted(c.value))}
+                              </button>
+                            )}
+                            <IconButton
+                              icon={X}
+                              title={`移除${constraintLabels[c.kind]}约束`}
+                              onClick={() =>
+                                transaction("移除约束", (_, s) => {
+                                  s.constraints = s.constraints.filter(
+                                    (item) => item.id !== c.id,
+                                  );
+                                })
+                              }
+                            />
+                          </div>
+                        );
+                      })}
+                  </div>
+                  <div className="parameter-footer">
+                    <button onClick={openParameters}>
+                      <SlidersHorizontal size={15} />
+                      参数<span>{doc.parameters.length}</span>
+                    </button>
+                  </div>
+                </>
+              )}
+            </aside>
+          </main>
+          <div className="bottom-strip">
+            <div className="sketch-tabs">
+              {doc.sketches.map((s) => (
+                <button
+                  key={s.id}
+                  className={s.id === activeId ? "active" : ""}
+                  onClick={() => switchSketch(s.id)}
+                >
+                  <Pencil size={12} />
+                  {s.name}
+                </button>
+              ))}
+              <IconButton icon={Plus} title="添加草图" onClick={createSketch} />
+            </div>
+            <div className="bottom-actions">
+              <IconButton
+                icon={Maximize2}
+                title="适配全部"
+                onClick={() => setFitKey((v) => v + 1)}
+              />
+              {(
+                [
+                  ["grid", Grid3X3, "网格捕获"],
+                  ["midpoint", Triangle, "中点捕获"],
+                  ["endpoint", CircleDot, "端点捕获"],
+                  ["tangent", Tangent, "切点捕获"],
+                  ["intersection", Crosshair, "相交点捕获"],
+                ] as const
+              ).map(([kind, Icon, title]) => (
+                <IconButton
+                  key={kind}
+                  icon={Icon}
+                  title={title}
+                  active={snapOptions[kind]}
+                  onClick={() =>
+                    setSnapOptions((current) => ({
+                      ...current,
+                      [kind]: !current[kind],
+                    }))
+                  }
+                />
+              ))}
+              <IconButton
+                icon={Magnet}
+                title="切换吸附"
+                active={snap}
+                onClick={() => setSnap(!snap)}
+              />
+            </div>
           </div>
-          <div className="parameter-footer">
-            <button onClick={openParameters}>
-              <SlidersHorizontal size={15} />
-              参数<span>{doc.parameters.length}</span>
-            </button>
-          </div>
-        </aside>
-      </main>
-      <div className="bottom-strip">
-        <div className="sketch-tabs">
-          {doc.sketches.map((s) => (
-            <button
-              key={s.id}
-              className={s.id === activeId ? "active" : ""}
-              onClick={() => switchSketch(s.id)}
-            >
-              <Pencil size={12} />
-              {s.name}
-            </button>
-          ))}
-          <IconButton icon={Plus} title="添加草图" onClick={createSketch} />
-        </div>
-        <div className="bottom-actions">
-          <IconButton
-            icon={Maximize2}
-            title="适配全部"
-            onClick={() => setFitKey((v) => v + 1)}
-          />
-          {(
-            [
-              ["grid", Grid3X3, "网格捕获"],
-              ["midpoint", Triangle, "中点捕获"],
-              ["endpoint", CircleDot, "端点捕获"],
-              ["tangent", Tangent, "切点捕获"],
-              ["intersection", Crosshair, "相交点捕获"],
-            ] as const
-          ).map(([kind, Icon, title]) => (
-            <IconButton
-              key={kind}
-              icon={Icon}
-              title={title}
-              active={snapOptions[kind]}
-              onClick={() =>
-                setSnapOptions((current) => ({
-                  ...current,
-                  [kind]: !current[kind],
-                }))
-              }
-            />
-          ))}
-          <IconButton
-            icon={Magnet}
-            title="切换吸附"
-            active={snap}
-            onClick={() => setSnap(!snap)}
-          />
         </div>
       </div>
       <footer className="status-bar">
@@ -3084,20 +3613,6 @@ export default function App() {
         </div>
       </footer>
       {menu && <div className="menu-dismiss" onClick={() => setMenu(null)} />}
-      {fileManager && (
-        <FileManager
-          mode={fileManager}
-          document={doc}
-          project={workspace.project}
-          activeFileId={workspace.activeFile?.id}
-          initialFolderId={workspace.activeFile?.parentId ?? ROOT_ID}
-          onOpen={openVirtualProject}
-          onSaved={saveVirtualProject}
-          onProjectChanged={workspace.updateProject}
-          onEntriesChanged={refreshVirtualFiles}
-          onClose={() => setFileManager(null)}
-        />
-      )}
       {modal && (
         <ModalView
           key={modal.title + modal.fields.map((f) => f.value).join("|")}
@@ -3128,6 +3643,7 @@ export default function App() {
               future.current = [];
               setHistoryVersion((value) => value + 1);
               workspace.detach(docRef.current, project);
+              registerUntitledTab(docRef.current.name);
               switchSketch(docRef.current.sketches[0].id);
               setFitKey((v) => v + 1);
               notify(isAsar ? "项目已打开" : "JSON 草图已打开");
@@ -3149,6 +3665,18 @@ export default function App() {
           />
         </div>
       )}
+      {projectTransition &&
+        createPortal(
+          <div
+            className="project-transition-overlay"
+            role="status"
+            aria-live="polite"
+          >
+            <LoaderCircle size={22} className="spin" />
+            <span>{projectTransition}…</span>
+          </div>,
+          window.document.body,
+        )}
     </div>
   );
 }

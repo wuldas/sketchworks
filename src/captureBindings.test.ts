@@ -16,7 +16,15 @@ import {
   type Sketch,
   type XY,
 } from "./model";
-import { dist, dot, intersections, sub, validGeometry } from "./geometry";
+import {
+  dist,
+  dot,
+  intersections,
+  sub,
+  add,
+  mul,
+  validGeometry,
+} from "./geometry";
 import {
   defaultSnapOptions,
   pathMidpoint,
@@ -580,7 +588,7 @@ describe("construction click-to-geometry mapping", () => {
     solve(roundTrip(s));
   });
 
-  it("binds an outer polygon sizing click to its apothem and orientation", () => {
+  it("binds an inscribed polygon sizing click to the edge-0 midpoint without solver movement", () => {
     const source = entity("point", [{ x: 20, y: 0 }]),
       s = sketch(source),
       points = [{ x: 0, y: 0 }, source.points[0]],
@@ -599,8 +607,36 @@ describe("construction click-to-geometry mapping", () => {
       true,
       "polygon",
     );
+    const helper = s.entities.find(
+      (e) => e.kind === "point" && e.ownerId === result.entities[0].id,
+    )!;
+    expect(s.constraints).toContainEqual(
+      expect.objectContaining({
+        kind: "midpoint",
+        refs: [helper.points[0].id, result.entities[0].id],
+      }),
+    );
+    expect(
+      s.entities.some(
+        (e) =>
+          e.kind === "line" &&
+          e.ownerId === result.entities[0].id &&
+          e.points[0].id === result.entities[0].points[0].id,
+      ),
+    ).toBe(false);
+    const before = s.entities.map((e) => structuredClone(e));
     fixed(s, source);
     solve(s);
+    s.entities.forEach((e, i) =>
+      e.points.forEach((p, j) => near(p, before[i].points[j])),
+    );
+    const edge = s.entities.find((e) => e.id === result.entities[0].id)!,
+      mid = {
+        x: (edge.points[0].x + edge.points[1].x) / 2,
+        y: (edge.points[0].y + edge.points[1].y) / 2,
+      };
+    near(mid, source.points[0]);
+    expect(dist(edge.points[0], source.points[0])).toBeGreaterThan(1);
     const outer = s.entities.find(
       (e) => e.kind === "circle" && e.ownerId === result.entities[0].id,
     )!;
@@ -610,6 +646,14 @@ describe("construction click-to-geometry mapping", () => {
         (c) => c.kind === "coincident" && c.refs.includes(source.points[0].id),
       ),
     ).toBe(true);
+    const restored = roundTrip(s);
+    deleteEntities(restored, [result.entities[0].id]);
+    expect(
+      restored.entities.some((e) => e.ownerId === result.entities[0].id),
+    ).toBe(false);
+    expect(
+      restored.constraints.some((c) => c.refs.includes(helper.points[0].id)),
+    ).toBe(false);
     solve(roundTrip(s));
   });
 
@@ -749,6 +793,79 @@ describe("construction click-to-geometry mapping", () => {
       expect(s.entities).toHaveLength(targets.length);
     },
   );
+
+  it("binds a three-point rectangle baseline exactly and its height click to the opposite edge", () => {
+    const pa = entity("point", [{ x: 3, y: 4 }]),
+      pb = entity("point", [{ x: 31, y: 13 }]),
+      pc = entity("point", [{ x: 12, y: 27 }]),
+      s = sketch(pa, pb, pc);
+    const es = create(
+      s,
+      "threeRectangle",
+      [pa.points[0], pb.points[0], pc.points[0]],
+      [pa.points[0].id, pb.points[0].id, pc.points[0].id],
+    );
+    const [l0, l1, l2] = es;
+    expect(s.constraints).toContainEqual(
+      expect.objectContaining({
+        kind: "coincident",
+        refs: [l0.points[0].id, pa.points[0].id],
+      }),
+    );
+    expect(s.constraints).toContainEqual(
+      expect.objectContaining({
+        kind: "coincident",
+        refs: [l0.points[1].id, pb.points[0].id],
+      }),
+    );
+    const helper = s.entities.find(
+      (e) => e.kind === "point" && e.ownerId === l0.id,
+    )!;
+    near(helper.points[0], pc.points[0]);
+    expect(
+      s.constraints.some(
+        (c) =>
+          c.kind === "onLine" &&
+          c.refs[0] === helper.points[0].id &&
+          c.refs[1] === l2.id,
+      ),
+    ).toBe(true);
+    expect(
+      s.constraints.some(
+        (c) =>
+          c.kind === "coincident" &&
+          [l2.points[0].id, l2.points[1].id].includes(c.refs[0]) &&
+          c.refs[1] === pc.points[0].id,
+      ),
+    ).toBe(false);
+    expect(dist(helper.points[0], l2.points[0])).toBeGreaterThan(1);
+    expect(dist(helper.points[0], l2.points[1])).toBeGreaterThan(1);
+    solve(s);
+    near(l0.points[0], pa.points[0]);
+    near(l0.points[1], pb.points[0]);
+    // Drag the sizing source, then pin: the height follows its offset.
+    pc.points[0].x -= 3;
+    pc.points[0].y += 9;
+    [pa, pb, pc].forEach((e) => fixed(s, e));
+    solve(s);
+    near(helper.points[0], pc.points[0]);
+    const d = sub(l0.points[1], l0.points[0]),
+      base = Math.hypot(d.x, d.y),
+      n = { x: -d.y / base, y: d.x / base },
+      h = dot(sub(pc.points[0], l0.points[0]), n);
+    expect(h).toBeGreaterThan(25);
+    expect(dist(l2.points[1], add(l0.points[0], mul(n, h)))).toBeLessThan(1e-6);
+    expect(
+      Math.abs(dot(sub(l1.points[1], l1.points[0]), d) / base),
+    ).toBeLessThan(1e-6);
+    const restored = roundTrip(s);
+    deleteEntities(
+      restored,
+      es.map((e) => e.id),
+    );
+    expect(restored.entities).toHaveLength(3);
+    expect(restored.constraints.filter((c) => c.kind !== "fixed")).toEqual([]);
+  });
 
   it("rejects malformed persisted bindings and helper ownership", () => {
     const s = sketch(entity("point", [{ x: 0, y: 0 }]));

@@ -60,6 +60,8 @@ export interface ViewportProps {
   selection: Selection[];
   tool: Tool;
   drafts: XY[];
+  /** Current point to append or re-pick in the creation workflow. */
+  creationActive: number;
   operationPreview?: Entity[] | null;
   config: CreateConfig;
   grid: boolean;
@@ -67,7 +69,7 @@ export interface ViewportProps {
   snapOptions?: SnapOptions;
   fitKey: number;
   unit: "mm" | "in";
-  onPlace: (point: XY, snapRef?: SnapReference, captured?: boolean) => void;
+  onPlace: (point: XY, snapRef?: SnapReference, captured?: boolean) => boolean;
   onSelect: (selection: Selection | null, additive: boolean) => void;
   onBox: (ids: string[], additive: boolean) => void;
   onCursor: (point: XY) => void;
@@ -104,8 +106,9 @@ export interface ViewportProps {
 type Size = { width: number; height: number };
 type Gesture = {
   id: number;
-  mode: "pan" | "box" | "place" | "drag" | "dimension";
+  mode: "pan" | "box" | "place" | "rectangle" | "drag" | "dimension";
   dimensionId?: string;
+  creationTool?: Tool;
   start: XY;
   startWorld: XY;
   startView: CanvasView;
@@ -193,8 +196,9 @@ export function Viewport(props: ViewportProps) {
       snapOptions: current.snapOptions ?? defaultSnapOptions,
       snapFrom:
         !current.pickDimension &&
-        (current.tool === "line" || current.tool === "midline")
-          ? current.drafts.at(-1)
+        (current.tool === "line" || current.tool === "midline") &&
+        current.creationActive > 0
+          ? current.drafts[0]
           : undefined,
       unit: current.unit,
       selection: current.selection,
@@ -242,7 +246,12 @@ export function Viewport(props: ViewportProps) {
       return false;
     if (activeGesture?.mode === "drag")
       return activeGesture.moved && !activeGesture.additive;
-    if (activeGesture && activeGesture.mode !== "place") return false;
+    if (
+      activeGesture &&
+      activeGesture.mode !== "place" &&
+      activeGesture.mode !== "rectangle"
+    )
+      return false;
     return current.pickParameters
       ? current.pickParameters === "position"
       : current.tool !== "select";
@@ -291,23 +300,38 @@ export function Viewport(props: ViewportProps) {
         pointer.current
       )
         currentFrame.marquee = { a: activeGesture.start, b: pointer.current };
-      if (currentFrame.cursor && current.tool !== "select") {
+      if (
+        current.tool !== "select" &&
+        (currentFrame.cursor || current.drafts.length)
+      ) {
         const key = JSON.stringify([
           current.tool,
           current.drafts,
+          current.creationActive,
           current.config,
           currentFrame.cursor,
         ]);
         if (previewCache.current.key !== key) {
           let entities: Entity[] = [];
-          const points =
-            current.tool === "spline"
-              ? appendSplinePoint(current.drafts, [], currentFrame.cursor)
-                  .points
-              : [...current.drafts, currentFrame.cursor];
+          let points = current.drafts;
+          if (currentFrame.cursor) {
+            const index = Math.min(
+              current.creationActive,
+              current.drafts.length,
+            );
+            points =
+              current.tool === "spline" && index === current.drafts.length
+                ? appendSplinePoint(current.drafts, [], currentFrame.cursor)
+                    .points
+                : [
+                    ...current.drafts.slice(0, index),
+                    currentFrame.cursor,
+                    ...current.drafts.slice(index + 1),
+                  ];
+          }
           if (
             points.length >= toolClicks[current.tool] ||
-            current.tool === "spline"
+            (current.tool === "spline" && points.length >= 2)
           ) {
             try {
               entities = createGeometry(
@@ -508,6 +532,13 @@ export function Viewport(props: ViewportProps) {
     if (inputFrame.current !== null) cancelAnimationFrame(inputFrame.current);
     inputFrame.current = null;
     pendingDrag.current = null;
+    if (
+      current?.mode === "rectangle" &&
+      current.creationTool === propsRef.current.tool &&
+      propsRef.current.drafts.length === 1 &&
+      propsRef.current.creationActive === 1
+    )
+      propsRef.current.onFinish();
     if (current?.mode === "dimension" && current.dragging)
       propsRef.current.onDimensionCancel?.();
     if (current?.dragging && current.selected)
@@ -531,6 +562,11 @@ export function Viewport(props: ViewportProps) {
       cancelGesture();
   }, [props.pickDimension, cancelGesture]);
   useLayoutEffect(() => {
+    const current = gesture.current;
+    if (current?.mode === "rectangle" && current.creationTool !== props.tool)
+      cancelGesture();
+  }, [props.tool, cancelGesture]);
+  useLayoutEffect(() => {
     renderer.current!.sync(props.sketches, props.activeId);
     requestDraw();
   }, [props.sketches, props.activeId, requestDraw]);
@@ -540,6 +576,7 @@ export function Viewport(props: ViewportProps) {
     props.selection,
     props.tool,
     props.drafts,
+    props.creationActive,
     props.operationPreview,
     props.config,
     props.grid,
@@ -625,7 +662,9 @@ export function Viewport(props: ViewportProps) {
         event.preventDefault();
         requestDraw();
       }
-      if (event.key === "Escape") cancelGesture();
+      // App exits creation on Escape; the tool-change effect cancels its held gesture.
+      if (event.key === "Escape" && gesture.current?.mode !== "rectangle")
+        cancelGesture();
     };
     const up = (event: KeyboardEvent) => {
       if (event.code === "Space") {
@@ -720,6 +759,12 @@ export function Viewport(props: ViewportProps) {
         : hit;
     const dimensionPick = !pan && !!current.pickDimension;
     const parameterPick = !pan && !!current.pickParameters;
+    const rectangleStart =
+      current.drafts.length === 0 &&
+      current.creationActive === 0 &&
+      (current.tool === "rectangle" ||
+        current.tool === "centerRectangle" ||
+        current.tool === "threeRectangle");
     let mode: Gesture["mode"] = pan
       ? "pan"
       : parameterPick
@@ -729,11 +774,19 @@ export function Viewport(props: ViewportProps) {
         : dimension
           ? "dimension"
           : dimensionPick || current.tool !== "select"
-            ? "place"
+            ? rectangleStart && !dimensionPick
+              ? "rectangle"
+              : "place"
             : selected
               ? "drag"
               : "box";
-    if (mode === "drag" || mode === "box" || parameterPick)
+    if (
+      mode === "drag" ||
+      mode === "box" ||
+      mode === "place" ||
+      mode === "rectangle" ||
+      parameterPick
+    )
       canvas.current?.focus({ preventScroll: true });
     if (dimensionPick || parameterPick) {
       // Command and dimension tools only collect references on release.
@@ -772,11 +825,28 @@ export function Viewport(props: ViewportProps) {
         ? dragAnchor(sketch, selected, dragSelection, world)
         : null;
     if (mode === "drag" && !anchor) return;
+    if (mode === "rectangle") {
+      const candidate = canSnap()
+        ? renderer.current!.snap(world, currentFrame)
+        : null;
+      if (
+        !current.onPlace(
+          candidate?.point ?? world,
+          candidate?.ref ?? candidate?.binding,
+          !!candidate,
+        )
+      ) {
+        event.preventDefault();
+        requestDraw();
+        return;
+      }
+    }
     terminalCapture.current = null;
     gesture.current = {
       id: event.pointerId,
       mode,
       dimensionId: dimension ?? undefined,
+      creationTool: mode === "rectangle" ? current.tool : undefined,
       start: point,
       startWorld: dimension ? dimensionWorld : (anchor?.point ?? world),
       startView: viewRef.current,
@@ -977,6 +1047,22 @@ export function Viewport(props: ViewportProps) {
         captured && captured.kind !== "grid" ? captured.point : undefined,
         captured?.ref ?? captured?.binding,
       );
+    } else if (activeGesture.mode === "rectangle") {
+      if (
+        (activeGesture.moved || dist(point, activeGesture.start) > 3) &&
+        current.tool === activeGesture.creationTool &&
+        current.drafts.length === 1 &&
+        current.creationActive === 1
+      ) {
+        const candidate = canSnap()
+          ? renderer.current!.snap(world, currentFrame)
+          : null;
+        current.onPlace(
+          candidate?.point ?? world,
+          candidate?.ref ?? candidate?.binding,
+          !!candidate,
+        );
+      }
     } else if (activeGesture.mode === "place" && !activeGesture.moved) {
       if (current.pickParameters) {
         const snap =
@@ -1138,7 +1224,7 @@ export function Viewport(props: ViewportProps) {
         style={{
           position: "absolute",
           left: 18,
-          top: 15,
+          top: "var(--view-badge-top, 15px)",
           pointerEvents: "none",
           fontSize: 11,
           color: "#718078",

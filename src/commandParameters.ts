@@ -121,7 +121,7 @@ export function operationGeometry(name: string): GeometryParameter[] {
 }
 export function constraintGeometry(kind: ConstraintKind): GeometryParameter[] {
   const point = (key: string, label: string) =>
-    parameter(key, label, "point", "选择端点、控制点或独立点");
+    parameter(key, label, "point", "选择端点、控制点、独立点或圆（按圆心）");
   const line = (key: string, label: string) =>
     parameter(key, label, "line", "选择一条直线");
   const curve = (key: string, label: string) =>
@@ -134,7 +134,7 @@ export function constraintGeometry(kind: ConstraintKind): GeometryParameter[] {
           "objects",
           "直线或两点",
           "pointOrLine",
-          "选择一条直线，或依次选择两个点",
+          "选择一条直线，或依次选择两个点（圆按圆心）",
           { multiple: true, max: 2 },
         ),
       ];
@@ -170,7 +170,7 @@ export function constraintGeometry(kind: ConstraintKind): GeometryParameter[] {
           "axis",
           "对称线或中心点",
           "pointOrLine",
-          "选择对称直线或中心点",
+          "选择对称直线或中心点（圆按圆心）",
         ),
       ];
     case "concentric":
@@ -202,7 +202,11 @@ export function normalizeParameterSelection(
     return null;
   const explicitPoint =
     picked.pointId && entity.points.some((p) => p.id === picked.pointId);
-  const isPoint = explicitPoint || entity.kind === "point";
+  // Point inputs accept a circle's native center; whole-object and curve inputs keep the circle.
+  const circleCenter =
+    entity.kind === "circle" &&
+    (parameter.kind === "point" || parameter.kind === "pointOrLine");
+  const isPoint = explicitPoint || entity.kind === "point" || circleCenter;
   switch (parameter.kind) {
     case "position":
       return null;
@@ -230,7 +234,9 @@ export function normalizeParameterSelection(
   );
   const pointId = pointParameter
     ? (picked.pointId ??
-      (entity.kind === "point" ? entity.points[0]?.id : undefined))
+      (entity.kind === "point" || circleCenter
+        ? entity.points[0]?.id
+        : undefined))
     : undefined;
   return { entityId: entity.id, ...(pointId ? { pointId } : {}) };
 }
